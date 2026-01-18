@@ -353,12 +353,11 @@ static void emitPrintString(const string& s) {
 
 %type <a> PROGRAM FDEFS
 %type <a> FUNC_DEC_API FUNC_DEF_API TYPE FUNC_ARGLIST DCL
-%type <a> BLK BLK_BEGIN BLK_END STLIST STMT CNTRL
+%type <a> BLK BLK_BEGIN BLK_END STLIST STMT CNTRL IF_COND
 %type <a> ASSN READ WRITE RETURN
 %type <a> EXP NUM CALL CALL_ARGS POS_ARGLIST NAMED_ARGLIST NAMED_ARG
 %type <a> LVAL
 %type <a> BEXP M N
-%type <a> STMT CNTRL IF_COND ...
 
 %left TK_OR
 %left TK_AND

@@ -358,6 +358,7 @@ static void emitPrintString(const string& s) {
 %type <a> EXP NUM CALL CALL_ARGS POS_ARGLIST NAMED_ARGLIST NAMED_ARG
 %type <a> LVAL
 %type <a> BEXP M N
+%type <a> STMT CNTRL IF_COND ...
 
 %left TK_OR
 %left TK_AND
@@ -378,7 +379,10 @@ PROGRAM
 FDEFS
     : FDEFS FUNC_DEC_API
     | FDEFS FUNC_DEF_API { beginFunction($2->str); } BLK { endFunction($4->nextList); }
-    | /* empty */
+    | /* empty */ 
+      { 
+          $$ = new Attr();
+      } 
     ;
 
 FUNC_DEC_API
@@ -656,32 +660,47 @@ RETURN
         }
     ;
 
+// Helper to handle the common prefix and the action
+IF_COND
+    : TK_IF BEXP 
+      { 
+          resetTemps(); 
+          $$ = $2; // Pass the BEXP attribute (trueList/falseList) up
+      }
+    ;
+	
 CNTRL
-    : TK_IF BEXP { resetTemps(); } TK_THEN M STMT TK_ELSE N M STMT
+    : IF_COND TK_THEN M STMT TK_ELSE N M STMT
         {
-            // if BEXP then STMT else STMT
-            g_code.backpatch($2->trueList, $5->quad);
-            g_code.backpatch($2->falseList, $9->quad);
+            // IF_COND is $1, M is $3, STMT(then) is $4, N is $6, M is $7, STMT(else) is $8
+            
+            // Backpatch BEXP (from IF_COND) true list to THEN block (M at $3)
+            g_code.backpatch($1->trueList, $3->quad);
+            
+            // Backpatch BEXP false list to ELSE block (M at $7)
+            g_code.backpatch($1->falseList, $7->quad);
 
             $$ = new Attr();
-            $$->nextList = mergeLists(mergeLists($6->nextList, $8->nextList), $10->nextList);
+            // Merge nextLists from Then-stmt ($4), Jump-over-else ($6), and Else-stmt ($8)
+            $$->nextList = mergeLists(mergeLists($4->nextList, $6->nextList), $8->nextList);
         }
-    | TK_IF BEXP { resetTemps(); } TK_THEN M STMT %prec IF_NO_ELSE
+    | IF_COND TK_THEN M STMT %prec IF_NO_ELSE
         {
-            // if BEXP then STMT
-            g_code.backpatch($2->trueList, $5->quad);
+            // IF_COND is $1, M is $3, STMT is $4
+            
+            // Backpatch BEXP true list to THEN block
+            g_code.backpatch($1->trueList, $3->quad);
+            
             $$ = new Attr();
-            $$->nextList = mergeLists($2->falseList, $6->nextList);
+            // Merge BEXP false list (skip if) with STMT nextList
+            $$->nextList = mergeLists($1->falseList, $4->nextList);
         }
     | TK_WHILE M BEXP { resetTemps(); } TK_DO M STMT
         {
-            // while M BEXP do M STMT
+            // (This part remains unchanged, just keep it here)
             g_code.backpatch($3->trueList, $6->quad);
             g_code.backpatch($7->nextList, $2->quad);
-
-            // unconditional loop back to condition
             g_code.emit("UJUMP " + std::to_string($2->quad));
-
             $$ = new Attr();
             $$->nextList = $3->falseList;
         }

@@ -259,8 +259,7 @@ static void beginFunction(const string& name) {
     g_code.emit("COPYI I4 I1");   // save old FP in I4
     g_code.emit("COPYI I1 I2");   // FP = SP (end of args)
     g_code.emit("STORI I4 I1 0"); // save old FP
-    g_code.emit("STORI I0 I1 4"); // save return address
-    g_code.emit("STORI I10 I1 4"); // Save the actual return address
+    g_code.emit("STORI I10 I1 4"); // save return address
 
     // Allocate locals (patched at end of function)
     g_localAllocInstrLine = g_code.nextQuad();

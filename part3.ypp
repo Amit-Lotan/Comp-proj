@@ -69,8 +69,8 @@ static vector<int> g_currentReturnJumps;
 static int g_nextIntReg = 10;
 static int g_nextFloatReg = 10;
 
-static int g_nextLocalOffset = 8;  // locals start at FP+8 (0/4 are saved oldFP/retAddr)
-static int g_localAllocInstrLine = -1; // line number of "ADD2I I2 I2 <locals>"
+static int g_nextLocalOffset = 8;  // locals start at FP+8
+static int g_localAllocInstrLine = -1; // line number of "ADD2I I2 I2 <frameSize>"
 
 static constexpr int INT_TMP_BASE = 11;
 static constexpr int FLOAT_TMP_BASE = 10;
@@ -165,7 +165,7 @@ static void insertParamsIntoCurrentScope() {
         const string& pname = g_currentParamNames[i];
         const Type ptype = g_currentParamTypes[i];
 
-        // Parameters are below FP (which points to end-of-args):
+        // Parameters are below FP (FP points to end-of-args):
         // param[i] offset = -4*(n - i)
         const int offset = -4 * (n - i);
         declareVarWithOffset(pname, ptype, offset);
@@ -181,6 +181,22 @@ static void declareFunction(const string& name, Type retType,
     sig.returnType = retType;
     sig.paramTypes = paramTypes;
     sig.paramNames = paramNames;
+
+    // Validate parameter lists (important even for declarations without bodies).
+    if (sig.paramTypes.size() != sig.paramNames.size()) {
+        semanticError("internal error: parameter list mismatch in function '" + name + "'");
+    }
+    {
+        std::unordered_set<string> seen;
+        for (size_t i = 0; i < sig.paramTypes.size(); ++i) {
+            if (sig.paramTypes[i] == void_t) {
+                semanticError("parameter '" + sig.paramNames[i] + "' cannot be declared as void in function '" + name + "'");
+            }
+            if (!seen.insert(sig.paramNames[i]).second) {
+                semanticError("duplicate parameter name '" + sig.paramNames[i] + "' in function '" + name + "'");
+            }
+        }
+    }
 
     // Enforce the runtime convention for main.
     if (name == "main") {
@@ -251,28 +267,35 @@ static void beginFunction(const string& name) {
         it->second.unresolvedCallLines.clear();
     }
 
-    // ---------------- Prologue (callee sets up frame) ----------------
-    // I1 = FP, I2 = SP, I0 = return address
-    // Frame base (FP) points to end-of-args.
-    // Mem[FP+0] = old FP, Mem[FP+4] = return address, locals from FP+8.
+    // ---------------- Prologue ----------------
+    // I0 = return address (set by JLINK)
+    // I1 = FP, I2 = SP
+    //
+    // We use a fixed 8-byte frame header:
+    //   Mem[FP+0] = old FP
+    //   Mem[FP+4] = saved return address (I0)
+    // Locals begin at FP+8.
 
-    g_code.emit("COPYI I4 I1");   // save old FP in I4
-    g_code.emit("COPYI I1 I2");   // FP = SP (end of args)
-    g_code.emit("STORI I4 I1 0"); // save old FP
-    g_code.emit("STORI I10 I1 4"); // save return address
+    g_code.emit("COPYI I4 I1");    // I4 = old FP
+    g_code.emit("COPYI I1 I2");    // FP = SP (end-of-args)
+    g_code.emit("STORI I4 I1 0");  // save old FP
+    g_code.emit("STORI I0 I1 4");  // save return address from I0
 
-    // Allocate locals (patched at end of function)
+    // Allocate frame header + locals (patched at end of function).
+    // NOTE: Even if there are 0 locals, we must still allocate 8 bytes
+    // so nested calls won't overwrite the saved header.
     g_localAllocInstrLine = g_code.nextQuad();
     g_code.emit("ADD2I I2 I2 ");
 }
 
 static void endFunction(const vector<int>& blkNextList) {
-    // Patch local allocation size
-    const int localsSize = g_nextLocalOffset - 8;
+    // Patch allocation size: header (8 bytes) + locals.
+    // g_nextLocalOffset starts at 8 and grows by 4 per local, so it is exactly frameSize.
+    const int frameSize = g_nextLocalOffset;
     if (g_localAllocInstrLine <= 0) {
         semanticError("internal error: missing local allocation instruction");
     }
-    g_code.backpatch(vector<int>{g_localAllocInstrLine}, localsSize);
+    g_code.backpatch(vector<int>{g_localAllocInstrLine}, frameSize);
 
     // Start of epilogue
     const int epilogueStart = g_code.nextQuad();
@@ -282,10 +305,10 @@ static void endFunction(const vector<int>& blkNextList) {
     g_code.backpatch(blkNextList, epilogueStart);
 
     // ---------------- Epilogue ----------------
-    g_code.emit("LOADI I4 I1 0"); // I4 = old FP
-    g_code.emit("LOADI I10 I1 4"); // Restore the actual return address
-    g_code.emit("COPYI I2 I1");   // SP = FP (pops locals + saved header)
-    g_code.emit("COPYI I1 I4");   // restore FP
+    g_code.emit("LOADI I4 I1 0");  // I4 = old FP
+    g_code.emit("LOADI I0 I1 4");  // restore return address into I0
+    g_code.emit("COPYI I2 I1");    // SP = FP (pops header+locals; leaves args for caller)
+    g_code.emit("COPYI I1 I4");    // restore FP
     g_code.emit("RETRN");
 
     // Reset per-function state
@@ -304,7 +327,6 @@ static void emitPrintString(const string& s) {
         unsigned char ch = static_cast<unsigned char>(s[i]);
         if (ch == '\\') {
             if (i + 1 >= s.size()) {
-                // Should not happen due to lexer validation
                 semanticError("invalid escape sequence in string literal");
             }
             const char esc = s[i + 1];
@@ -315,7 +337,6 @@ static void emitPrintString(const string& s) {
                 case '"': ch = '"'; break;
                 case '\\': ch = '\\'; break;
                 default:
-                    // Lexer disallows other escapes
                     semanticError("invalid escape sequence in string literal");
             }
         }
@@ -377,10 +398,10 @@ PROGRAM
 FDEFS
     : FDEFS FUNC_DEC_API
     | FDEFS FUNC_DEF_API { beginFunction($2->str); } BLK { endFunction($4->nextList); }
-    | /* empty */ 
-      { 
+    | /* empty */
+      {
           $$ = new Attr();
-      } 
+      }
     ;
 
 FUNC_DEC_API
@@ -421,7 +442,6 @@ FUNC_ARGLIST
     : FUNC_ARGLIST ',' DCL
         {
             $$ = $1;
-            // Append DCL's ids (in order) to the list
             for (size_t i = 0; i < $3->names.size(); ++i) {
                 $$->paramNames.push_back($3->names[i]);
                 $$->paramTypes.push_back($3->type);
@@ -454,7 +474,7 @@ DCL
 BLK
     : '{' BLK_BEGIN STLIST '}' BLK_END
         {
-            $$ = $3; // carry nextList
+            $$ = $3;
         }
     ;
 
@@ -464,7 +484,6 @@ BLK_BEGIN
             pushScope();
             g_blockDepth++;
             if (g_blockDepth == 1) {
-                // Outermost function block: insert parameters into this scope.
                 insertParamsIntoCurrentScope();
             }
             $$ = new Attr();
@@ -513,7 +532,6 @@ N
 STMT
     : DCL ';'
         {
-            // Declare each variable in current scope
             for (const auto& name : $1->names) {
                 declareLocal(name, $1->type);
             }
@@ -658,44 +676,32 @@ RETURN
         }
     ;
 
-// Helper to handle the common prefix and the action
 IF_COND
-    : TK_IF BEXP 
-      { 
-          resetTemps(); 
-          $$ = $2; // Pass the BEXP attribute (trueList/falseList) up
+    : TK_IF BEXP
+      {
+          resetTemps();
+          $$ = $2;
       }
     ;
-	
+
 CNTRL
     : IF_COND TK_THEN M STMT TK_ELSE N M STMT
         {
-            // IF_COND is $1, M is $3, STMT(then) is $4, N is $6, M is $7, STMT(else) is $8
-            
-            // Backpatch BEXP (from IF_COND) true list to THEN block (M at $3)
             g_code.backpatch($1->trueList, $3->quad);
-            
-            // Backpatch BEXP false list to ELSE block (M at $7)
             g_code.backpatch($1->falseList, $7->quad);
 
             $$ = new Attr();
-            // Merge nextLists from Then-stmt ($4), Jump-over-else ($6), and Else-stmt ($8)
             $$->nextList = mergeLists(mergeLists($4->nextList, $6->nextList), $8->nextList);
         }
     | IF_COND TK_THEN M STMT %prec IF_NO_ELSE
         {
-            // IF_COND is $1, M is $3, STMT is $4
-            
-            // Backpatch BEXP true list to THEN block
             g_code.backpatch($1->trueList, $3->quad);
-            
+
             $$ = new Attr();
-            // Merge BEXP false list (skip if) with STMT nextList
             $$->nextList = mergeLists($1->falseList, $4->nextList);
         }
     | TK_WHILE M BEXP { resetTemps(); } TK_DO M STMT
         {
-            // (This part remains unchanged, just keep it here)
             g_code.backpatch($3->trueList, $6->quad);
             g_code.backpatch($7->nextList, $2->quad);
             g_code.emit("UJUMP " + std::to_string($2->quad));
@@ -735,24 +741,35 @@ BEXP
             }
 
             const string& op = $2->str;
-            const int cond = allocIntReg();
+
+            // We branch on an INT condition register.
+            int condI = -1;
 
             if ($1->type == int_) {
-                if (op == "==")      g_code.emit("SEQUI " + Ireg(cond) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
-                else if (op == "<>") g_code.emit("SNEQI " + Ireg(cond) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
-                else if (op == "<")  g_code.emit("SLETI " + Ireg(cond) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
-                else if (op == ">")  g_code.emit("SGRTI " + Ireg(cond) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
-                else if (op == "<=") g_code.emit("SGRTI " + Ireg(cond) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
-                else if (op == ">=") g_code.emit("SLETI " + Ireg(cond) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                condI = allocIntReg();
+
+                if (op == "==")      g_code.emit("SEQUI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == "<>") g_code.emit("SNEQI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == "<")  g_code.emit("SLETI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == ">")  g_code.emit("SGRTI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == "<=") g_code.emit("SGRTI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == ">=") g_code.emit("SLETI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
                 else semanticError("unknown relop '" + op + "'");
             } else {
-                if (op == "==")      g_code.emit("SEQUF " + Ireg(cond) + " " + Freg($1->reg) + " " + Freg($3->reg));
-                else if (op == "<>") g_code.emit("SNEQF " + Ireg(cond) + " " + Freg($1->reg) + " " + Freg($3->reg));
-                else if (op == "<")  g_code.emit("SLETF " + Ireg(cond) + " " + Freg($1->reg) + " " + Freg($3->reg));
-                else if (op == ">")  g_code.emit("SGRTF " + Ireg(cond) + " " + Freg($1->reg) + " " + Freg($3->reg));
-                else if (op == "<=") g_code.emit("SGRTF " + Ireg(cond) + " " + Freg($1->reg) + " " + Freg($3->reg));
-                else if (op == ">=") g_code.emit("SLETF " + Ireg(cond) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                // Float comparisons: *_F instructions require float registers, including destination.
+                const int condF = allocFloatReg();
+
+                if (op == "==")      g_code.emit("SEQUF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == "<>") g_code.emit("SNEQF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == "<")  g_code.emit("SLETF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == ">")  g_code.emit("SGRTF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == "<=") g_code.emit("SGRTF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == ">=") g_code.emit("SLETF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
                 else semanticError("unknown relop '" + op + "'");
+
+                // Convert 0/1 float result to an int register for branching.
+                condI = allocIntReg();
+                g_code.emit("CFTOI " + Ireg(condI) + " " + Freg(condF));
             }
 
             // For <= and >= we computed the *opposite* condition (>): true if cond==0.
@@ -761,9 +778,9 @@ BEXP
             $$ = new Attr();
             const int bline = g_code.nextQuad();
             if (trueOnZero) {
-                g_code.emit("BREQZ " + Ireg(cond) + " ");
+                g_code.emit("BREQZ " + Ireg(condI) + " ");
             } else {
-                g_code.emit("BNEQZ " + Ireg(cond) + " ");
+                g_code.emit("BNEQZ " + Ireg(condI) + " ");
             }
             $$->trueList.push_back(bline);
 
@@ -792,7 +809,6 @@ EXP
             $$->type = $1->type;
 
             if ($1->type == int_) {
-                // Reuse the left register as the destination (reduces temp pressure)
                 const int dst = $1->reg;
                 if (op == "+")      g_code.emit("ADD2I " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
                 else if (op == "-") g_code.emit("SUBTI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
@@ -841,14 +857,19 @@ EXP
             // !exp returns int: 1 if exp == 0 else 0
             $$ = new Attr();
             $$->type = int_;
-            const int r = ($2->type == int_) ? $2->reg : allocIntReg();
+
             if ($2->type == int_) {
-                // Reuse the operand int register for the result.
+                const int r = $2->reg;
                 g_code.emit("SEQUI " + Ireg(r) + " " + Ireg(r) + " 0");
+                $$->reg = r;
             } else {
-                g_code.emit("SEQUF " + Ireg(r) + " " + Freg($2->reg) + " 0.0");
+                // Float: compare in float regs, then convert 0/1 float to int
+                const int tmpF = allocFloatReg();
+                g_code.emit("SEQUF " + Freg(tmpF) + " " + Freg($2->reg) + " 0.0");
+                const int r = allocIntReg();
+                g_code.emit("CFTOI " + Ireg(r) + " " + Freg(tmpF));
+                $$->reg = r;
             }
-            $$->reg = r;
         }
     | TK_ID
         {
@@ -887,7 +908,6 @@ EXP
             const Type fromT = $4->type;
 
             if (toT == void_t) {
-                // Evaluate operand for side-effects, discard value
                 $$ = new Attr();
                 $$->type = void_t;
                 $$->reg = -1;
@@ -947,7 +967,6 @@ CALL
             const FunctionInfo& finfo = fit->second;
             const int nparams = static_cast<int>(finfo.paramTypes.size());
 
-            // Collect provided arguments
             const int npos = static_cast<int>($3->posTypes.size());
             if (npos > nparams) {
                 semanticError("too many positional arguments in call to '" + fname + "'");
@@ -957,14 +976,12 @@ CALL
             vector<Type> argTypes(static_cast<size_t>(nparams), void_t);
             vector<int> argRegs(static_cast<size_t>(nparams), -1);
 
-            // Positional args
             for (int i = 0; i < npos; ++i) {
                 provided[i] = true;
                 argTypes[i] = $3->posTypes[i];
                 argRegs[i] = $3->posRegs[i];
             }
 
-            // Named args
             for (size_t j = 0; j < $3->namedNames.size(); ++j) {
                 const string& label = $3->namedNames[j];
 
@@ -990,7 +1007,6 @@ CALL
                 argRegs[idx] = $3->namedRegs[j];
             }
 
-            // Must provide all params
             for (int i = 0; i < nparams; ++i) {
                 if (!provided[i]) {
                     semanticError("missing argument for parameter '" + finfo.paramNames[i] + "' in call to '" + fname + "'");
@@ -1000,15 +1016,12 @@ CALL
                 }
             }
 
-            // ---- Codegen: save caller temps, push args, JLINK, pop args, restore temps ----
-
             const int intTempsUsed = g_nextIntReg - INT_TMP_BASE;
             const int floatTempsUsed = g_nextFloatReg - FLOAT_TMP_BASE;
             const int saveCount = intTempsUsed + floatTempsUsed;
             const int saveSize = 4 * saveCount;
             const int argSize = 4 * nparams;
 
-            // Save caller temps to stack
             if (saveSize > 0) {
                 int offset = 0;
                 for (int r = INT_TMP_BASE; r < g_nextIntReg; ++r) {
@@ -1022,7 +1035,6 @@ CALL
                 g_code.emit("ADD2I I2 I2 " + std::to_string(saveSize));
             }
 
-            // Push arguments in parameter order
             for (int i = 0; i < nparams; ++i) {
                 if (finfo.paramTypes[i] == int_) {
                     g_code.emit("STORI " + Ireg(argRegs[i]) + " I2 0");
@@ -1032,29 +1044,22 @@ CALL
                 g_code.emit("ADD2I I2 I2 4");
             }
 
-            // Emit call
             const int callLine = g_code.nextQuad();
             g_code.emit("JLINK ");
 
-            // Record this call site for the header
             g_functions[fname].callLines.push_back(callLine);
 
             if (finfo.isDefined) {
-                // Already defined in this file => patch immediately
                 g_code.backpatch(vector<int>{callLine}, finfo.startLineImplementation);
             } else {
-                // Not defined here => remains unresolved until link (or until later def in this file)
                 g_functions[fname].unresolvedCallLines.push_back(callLine);
             }
 
-            // Pop arguments
             if (argSize > 0) {
                 g_code.emit("SUBTI I2 I2 " + std::to_string(argSize));
             }
 
-            // Restore caller temps
             if (saveSize > 0) {
-                // I4 = start of save area
                 g_code.emit("SUBTI I4 I2 " + std::to_string(saveSize));
 
                 int offset = 0;
@@ -1070,7 +1075,6 @@ CALL
                 g_code.emit("SUBTI I2 I2 " + std::to_string(saveSize));
             }
 
-            // Return value
             $$ = new Attr();
             $$->type = finfo.returnType;
             if (finfo.returnType == int_) {
@@ -1159,11 +1163,9 @@ void yyerror(const char* /*s*/) {
 }
 
 static string basenameNoExt(const string& path) {
-    // Strip directories
     size_t pos = path.find_last_of("/\\\\");
     string base = (pos == string::npos) ? path : path.substr(pos + 1);
 
-    // Strip extension
     size_t dot = base.find_last_of('.');
     if (dot == string::npos) {
         return base;
@@ -1186,11 +1188,8 @@ int main(int argc, char** argv) {
         operationalError("cannot open input file");
     }
 
-    // Parse (errors will exit with required code)
     yyparse();
 
-    // Patch any remaining unresolved internal call sites for functions that
-    // were declared-but-not-defined in this file. We leave '0' for the linker.
     for (auto& kv : g_functions) {
         FunctionInfo& info = kv.second;
         if (!info.isDefined) {
@@ -1209,7 +1208,6 @@ int main(int argc, char** argv) {
         operationalError("cannot open output file for writing");
     }
 
-    // Build header lines
     string unimpl = "<unimplemented>";
     string impl = "<implemented>";
 

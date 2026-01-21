@@ -5,8 +5,6 @@
 
 #include "part3_helpers.hpp"
 #include "part3.tab.hpp"
-
-// yytext and yylineno are provided by Flex.
 %}
 
 %option noyywrap yylineno nodefault
@@ -19,6 +17,7 @@ RELOP         (==|<>|<=|>=|<|>)
 ADDOP         (\+|-)
 MULOP         (\*|\/)
 STR           \"([^\"\\\n\r]|\\[tn\"\\])*\"
+BADSTR        \"([^\"\\\n\r]|\\.)*\"
 
 WS            [ \t\r]+
 COMMENT       \#.*
@@ -73,7 +72,6 @@ COMMENT       \#.*
                     }
 
 {STR}               {
-                        // Strip the surrounding quotes, keep the inner content (with escapes still encoded).
                         std::string s(yytext);
                         yylval.a = new Attr();
                         if (s.size() >= 2) {
@@ -82,6 +80,12 @@ COMMENT       \#.*
                             yylval.a->str.clear();
                         }
                         return TK_STR;
+                    }
+
+/* Properly terminated string, but contains an illegal escape like \q */
+{BADSTR}            {
+                        std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
+                        std::exit(LEXICAL_ERROR);
                     }
 
 {REALNUM}            {

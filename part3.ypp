@@ -1,736 +1,1236 @@
 %{
-    #include "part3_helpers.hpp"
-    #include <iostream>
-    #include <stdlib.h>
-    #include <stdio.h>
-    #include <string>
-    #include <vector>
-    #include <map>
-    #include <algorithm>
-    #include <fstream>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
-    using namespace std;
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-    extern int yylex();
-    extern int yylineno;
-    extern char* yytext;
-    extern FILE* yyin;
-    void yyerror(char const* s);
+#include "part3_helpers.hpp"
 
-    // Globals
-    CodeBuffer mainBuffer;
-    CodeBuffer* buffer = &mainBuffer;
-    
-    map<string, Function> functionTable;
-    map<string, vector<Symbol> > symbolTable;
-    
-    int currentScopeOffset = 0; 
-    // Start allocating at 10 to avoid I0 (Res), I1 (FP), I2 (SP), I7 (RA)
-    int currentScopeRegsNum = 10; 
-    Type currentReturnType = void_t;
-    int currentBlockDepth = 0;
-    
-    // Track types to prevent VM errors
-    vector<Type> regTypes(200, void_t); 
-    vector<vector<string> > scopeVarNames;
+using std::cerr;
+using std::cout;
+using std::endl;
+using std::string;
+using std::vector;
 
-    void printSemanticError(string err) {
-        cerr << "Semantic error: " << err << " in line number " << yylineno << endl;
-        exit(SEMANTIC_ERROR);
+extern int yylex(void);
+extern int yylineno;
+extern char* yytext;
+extern FILE* yyin;
+
+// Forward declare bison error handler
+void yyerror(const char* s);
+
+// -------------------- Global compiler state --------------------
+
+struct VarBinding {
+    Type type;
+    int offset; // bytes, relative to I1
+};
+
+struct FunctionInfo {
+    Type returnType = void_t;
+    vector<Type> paramTypes;
+    vector<string> paramNames; // significant: used by named arguments
+
+    bool isDefined = false;
+    int startLineImplementation = 0;
+
+    // All call sites in this compilation unit (line numbers of JLINK insts)
+    vector<int> callLines;
+
+    // Call sites emitted with an unresolved jump target that we will patch
+    // if the function is later defined in this same file.
+    vector<int> unresolvedCallLines;
+};
+
+static CodeBuffer g_code;
+static std::map<string, FunctionInfo> g_functions;
+
+// Per-function variable table (no globals in the language)
+static std::unordered_map<string, vector<VarBinding>> g_vars; // stack per id
+static vector<std::unordered_set<string>> g_scopes;
+
+static int g_blockDepth = 0;
+static bool g_paramsInserted = false;
+
+static string g_currentFunc;
+static Type g_currentReturnType = void_t;
+static vector<Type> g_currentParamTypes;
+static vector<string> g_currentParamNames;
+static vector<int> g_currentReturnJumps;
+
+static int g_nextIntReg = 10;
+static int g_nextFloatReg = 10;
+
+static int g_nextLocalOffset = 8;  // locals start at FP+8
+static int g_localAllocInstrLine = -1; // line number of "ADD2I I2 I2 <frameSize>"
+
+static constexpr int INT_TMP_BASE = 11;
+static constexpr int FLOAT_TMP_BASE = 10;
+
+// -------------------- Error helpers --------------------
+
+[[noreturn]] static void semanticError(const string& msg) {
+    cerr << "Semantic error: " << msg << " in line number " << yylineno << endl;
+    std::exit(SEMANTIC_ERROR);
+}
+
+[[noreturn]] static void operationalError(const string& msg) {
+    cerr << "Operational error: " << msg << endl;
+    std::exit(OPERATIONAL_ERROR);
+}
+
+// -------------------- Small utilities --------------------
+
+static inline string Ireg(int r) { return "I" + std::to_string(r); }
+static inline string Freg(int r) { return "F" + std::to_string(r); }
+
+static inline void resetTemps() {
+    g_nextIntReg = INT_TMP_BASE;
+    g_nextFloatReg = FLOAT_TMP_BASE;
+}
+
+static inline int allocIntReg() { return g_nextIntReg++; }
+static inline int allocFloatReg() { return g_nextFloatReg++; }
+
+static inline bool sameSignature(const FunctionInfo& a, const FunctionInfo& b) {
+    return a.returnType == b.returnType && a.paramTypes == b.paramTypes && a.paramNames == b.paramNames;
+}
+
+static VarBinding lookupVar(const string& name) {
+    auto it = g_vars.find(name);
+    if (it == g_vars.end() || it->second.empty()) {
+        semanticError("variable '" + name + "' is not declared");
     }
+    return it->second.back();
+}
 
-    void printOperationalError(string err) {
-        cerr << "Operational error: " << err << endl;
-        exit(OPERATIONAL_ERROR);
+static bool declaredInCurrentScope(const string& name) {
+    if (g_scopes.empty()) {
+        return false;
     }
-    
-    string typeToString(Type t) {
-        if(t == int_t) return "int";
-        if(t == float_type) return "float";
-        return "void";
-    }
+    return g_scopes.back().find(name) != g_scopes.back().end();
+}
 
-    int nextReg(Type t) {
-        if (currentScopeRegsNum >= (int)regTypes.size()) {
-            regTypes.resize(currentScopeRegsNum * 2, void_t);
+static void pushScope() {
+    g_scopes.emplace_back();
+}
+
+static void popScope() {
+    if (g_scopes.empty()) {
+        return;
+    }
+    for (const auto& name : g_scopes.back()) {
+        auto it = g_vars.find(name);
+        if (it != g_vars.end() && !it->second.empty()) {
+            it->second.pop_back();
+            if (it->second.empty()) {
+                g_vars.erase(it);
+            }
         }
-        regTypes[currentScopeRegsNum] = t;
-        return currentScopeRegsNum++;
     }
+    g_scopes.pop_back();
+}
+
+static void declareVarWithOffset(const string& name, Type t, int offset) {
+    if (t == void_t) {
+        semanticError("'" + name + "' cannot be declared as void");
+    }
+    if (declaredInCurrentScope(name)) {
+        semanticError("redefinition of variable '" + name + "' in the same scope");
+    }
+    g_scopes.back().insert(name);
+    g_vars[name].push_back(VarBinding{t, offset});
+}
+
+static void declareLocal(const string& name, Type t) {
+    const int offset = g_nextLocalOffset;
+    g_nextLocalOffset += 4;
+    declareVarWithOffset(name, t, offset);
+}
+
+static void insertParamsIntoCurrentScope() {
+    if (g_paramsInserted) {
+        return;
+    }
+    const int n = static_cast<int>(g_currentParamTypes.size());
+    for (int i = 0; i < n; ++i) {
+        const string& pname = g_currentParamNames[i];
+        const Type ptype = g_currentParamTypes[i];
+
+        // Parameters are below FP (FP points to end-of-args):
+        // param[i] offset = -4*(n - i)
+        const int offset = -4 * (n - i);
+        declareVarWithOffset(pname, ptype, offset);
+    }
+    g_paramsInserted = true;
+}
+
+static void declareFunction(const string& name, Type retType,
+                            const vector<Type>& paramTypes,
+                            const vector<string>& paramNames,
+                            bool isDefinition) {
+    FunctionInfo sig;
+    sig.returnType = retType;
+    sig.paramTypes = paramTypes;
+    sig.paramNames = paramNames;
+
+    // Validate parameter lists (important even for declarations without bodies).
+    if (sig.paramTypes.size() != sig.paramNames.size()) {
+        semanticError("internal error: parameter list mismatch in function '" + name + "'");
+    }
+    {
+        std::unordered_set<string> seen;
+        for (size_t i = 0; i < sig.paramTypes.size(); ++i) {
+            if (sig.paramTypes[i] == void_t) {
+                semanticError("parameter '" + sig.paramNames[i] + "' cannot be declared as void in function '" + name + "'");
+            }
+            if (!seen.insert(sig.paramNames[i]).second) {
+                semanticError("duplicate parameter name '" + sig.paramNames[i] + "' in function '" + name + "'");
+            }
+        }
+    }
+
+    // Enforce the runtime convention for main.
+    if (name == "main") {
+        if (retType != void_t || !paramTypes.empty()) {
+            semanticError("function 'main' must have signature 'void main()'");
+        }
+    }
+
+    auto it = g_functions.find(name);
+    if (it == g_functions.end()) {
+        FunctionInfo info = sig;
+        info.isDefined = false;
+        info.startLineImplementation = 0;
+        g_functions.emplace(name, std::move(info));
+        it = g_functions.find(name);
+    } else {
+        // Validate signature matches previous declaration/definition.
+        FunctionInfo existingSig = it->second;
+        existingSig.isDefined = false;
+        existingSig.startLineImplementation = 0;
+        existingSig.callLines.clear();
+        existingSig.unresolvedCallLines.clear();
+
+        if (!sameSignature(existingSig, sig)) {
+            semanticError("function '" + name + "' declared with a different signature");
+        }
+
+        if (isDefinition && it->second.isDefined) {
+            semanticError("redefinition of function '" + name + "'");
+        }
+    }
+
+    if (isDefinition) {
+        // Mark as defined; start line set in beginFunction()
+        it->second.isDefined = true;
+    }
+}
+
+static void beginFunction(const string& name) {
+    auto it = g_functions.find(name);
+    if (it == g_functions.end()) {
+        semanticError("internal error: beginFunction on unknown function '" + name + "'");
+    }
+
+    g_currentFunc = name;
+    g_currentReturnType = it->second.returnType;
+    g_currentParamTypes = it->second.paramTypes;
+    g_currentParamNames = it->second.paramNames;
+
+    // Reset per-function state
+    g_vars.clear();
+    g_scopes.clear();
+    g_blockDepth = 0;
+    g_paramsInserted = false;
+
+    resetTemps();
+    g_nextLocalOffset = 8;
+    g_localAllocInstrLine = -1;
+    g_currentReturnJumps.clear();
+
+    // Function entry line number
+    const int startLine = g_code.nextQuad();
+    it->second.startLineImplementation = startLine;
+
+    // Patch any call sites that appeared before the definition (but after decl)
+    if (!it->second.unresolvedCallLines.empty()) {
+        g_code.backpatch(it->second.unresolvedCallLines, startLine);
+        it->second.unresolvedCallLines.clear();
+    }
+
+    // ---------------- Prologue ----------------
+    // I0 = return address (set by JLINK)
+    // I1 = FP, I2 = SP
+    //
+    // We use a fixed 8-byte frame header:
+    //   Mem[FP+0] = old FP
+    //   Mem[FP+4] = saved return address (I0)
+    // Locals begin at FP+8.
+
+    g_code.emit("COPYI I4 I1");    // I4 = old FP
+    g_code.emit("COPYI I1 I2");    // FP = SP (end-of-args)
+    g_code.emit("STORI I4 I1 0");  // save old FP
+    g_code.emit("STORI I0 I1 4");  // save return address from I0
+
+    // Allocate frame header + locals (patched at end of function).
+    // NOTE: Even if there are 0 locals, we must still allocate 8 bytes
+    // so nested calls won't overwrite the saved header.
+    g_localAllocInstrLine = g_code.nextQuad();
+    g_code.emit("ADD2I I2 I2 ");
+}
+
+static void endFunction(const vector<int>& blkNextList) {
+    // Patch allocation size: header (8 bytes) + locals.
+    // g_nextLocalOffset starts at 8 and grows by 4 per local, so it is exactly frameSize.
+    const int frameSize = g_nextLocalOffset;
+    if (g_localAllocInstrLine <= 0) {
+        semanticError("internal error: missing local allocation instruction");
+    }
+    g_code.backpatch(vector<int>{g_localAllocInstrLine}, frameSize);
+
+    // Start of epilogue
+    const int epilogueStart = g_code.nextQuad();
+
+    // Patch all jumps that should go to function end
+    g_code.backpatch(g_currentReturnJumps, epilogueStart);
+    g_code.backpatch(blkNextList, epilogueStart);
+
+    // ---------------- Epilogue ----------------
+    g_code.emit("LOADI I4 I1 0");  // I4 = old FP
+    g_code.emit("LOADI I0 I1 4");  // restore return address into I0
+    g_code.emit("COPYI I2 I1");    // SP = FP (pops header+locals; leaves args for caller)
+    g_code.emit("COPYI I1 I4");    // restore FP
+    g_code.emit("RETRN");
+
+    // Reset per-function state
+    g_currentFunc.clear();
+    g_currentReturnType = void_t;
+    g_currentParamTypes.clear();
+    g_currentParamNames.clear();
+    g_currentReturnJumps.clear();
+    g_blockDepth = 0;
+    g_paramsInserted = false;
+    resetTemps();
+}
+
+static void emitPrintString(const string& s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char ch = static_cast<unsigned char>(s[i]);
+        if (ch == '\\') {
+            if (i + 1 >= s.size()) {
+                semanticError("invalid escape sequence in string literal");
+            }
+            const char esc = s[i + 1];
+            i++;
+            switch (esc) {
+                case 'n': ch = '\n'; break;
+                case 't': ch = '\t'; break;
+                case '"': ch = '"'; break;
+                case '\\': ch = '\\'; break;
+                default:
+                    semanticError("invalid escape sequence in string literal");
+            }
+        }
+        g_code.emit("PRNTC " + std::to_string(static_cast<int>(ch)));
+    }
+}
+
+// -------------------- Bison declarations --------------------
 %}
 
+%code requires {
+#include "part3_helpers.hpp"
+}
+
 %union {
-    Node* node;
+    Attr* a;
 }
 
-%token <node> TINT TFLOAT TVOID
-%token <node> TWRITE TREAD TWHILE TDO TRET TID TNUM TREAL TSTR
-%token <node> TRELOP TADDOP TMULOP TASSIGN
-%token <node> TIF TTHEN TELSE
-%token <node> TOR TAND TNOT
+%token TK_INT TK_FLOAT TK_VOID
+%token TK_IF TK_THEN TK_ELSE
+%token TK_WHILE TK_DO
+%token TK_READ TK_WRITE
+%token TK_RETURN
 
-%type <node> PROGRAM FDEFS FUNC_HEADER FUNC_DEF_START BLK BLK_OPEN BLK_CLOSE M N
-%type <node> FUNC_ARGS FUNC_ARGLIST DCL TYPE
-%type <node> STLIST STMT ASSN EXP CALL CALL_ARGS CALL_ARGS_LIST
-%type <node> CNTRL BEXP WRITE READ LVAL RETURN
-%type <node> CALL_ARG_ITEM
+%token TK_AND TK_OR TK_NOT
+%token TK_ASSIGN
 
-%right TASSIGN
-%left TOR
-%left TAND
-%left TRELOP
-%left TADDOP
-%left TMULOP
-%right TNOT
-%nonassoc TIF_NO_ELSE
-%nonassoc TELSE
-%left '(' ')'
-%left ','
+%token <a> TK_ID
+%token <a> TK_INTEGERNUM TK_REALNUM
+%token <a> TK_STR
+%token <a> TK_RELOP TK_ADDOP TK_MULOP
+
+%token TK_CAST
+
+%type <a> PROGRAM FDEFS
+%type <a> FUNC_DEC_API FUNC_DEF_API TYPE FUNC_ARGLIST DCL
+%type <a> BLK BLK_BEGIN BLK_END STLIST STMT CNTRL IF_COND
+%type <a> ASSN READ WRITE RETURN
+%type <a> EXP NUM CALL CALL_ARGS POS_ARGLIST NAMED_ARGLIST NAMED_ARG
+%type <a> LVAL
+%type <a> BEXP M N
+
+%left TK_OR
+%left TK_AND
+%left TK_RELOP
+%left TK_ADDOP
+%left TK_MULOP
+%right TK_NOT
+%right TK_CAST
+%nonassoc IF_NO_ELSE
+%nonassoc TK_ELSE
 
 %%
 
-PROGRAM : FDEFS {
-        for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); ++it) {
-            if(it->second.defined) {
-                buffer->backpatch(it->second.callingLines, it->second.startLineImplementation);
+PROGRAM
+    : FDEFS
+    ;
+
+FDEFS
+    : FDEFS FUNC_DEC_API
+    | FDEFS FUNC_DEF_API { beginFunction($2->str); } BLK { endFunction($4->nextList); }
+    | /* empty */
+      {
+          $$ = new Attr();
+      }
+    ;
+
+FUNC_DEC_API
+    : TYPE TK_ID '(' ')' ';'
+        {
+            declareFunction($2->str, $1->type, {}, {}, false);
+            $$ = new Attr();
+        }
+    | TYPE TK_ID '(' FUNC_ARGLIST ')' ';'
+        {
+            declareFunction($2->str, $1->type, $4->paramTypes, $4->paramNames, false);
+            $$ = new Attr();
+        }
+    ;
+
+FUNC_DEF_API
+    : TYPE TK_ID '(' ')'
+        {
+            declareFunction($2->str, $1->type, {}, {}, true);
+            $$ = new Attr();
+            $$->str = $2->str;
+        }
+    | TYPE TK_ID '(' FUNC_ARGLIST ')'
+        {
+            declareFunction($2->str, $1->type, $4->paramTypes, $4->paramNames, true);
+            $$ = new Attr();
+            $$->str = $2->str;
+        }
+    ;
+
+TYPE
+    : TK_INT   { $$ = new Attr(); $$->type = int_; }
+    | TK_FLOAT { $$ = new Attr(); $$->type = float_; }
+    | TK_VOID  { $$ = new Attr(); $$->type = void_t; }
+    ;
+
+FUNC_ARGLIST
+    : FUNC_ARGLIST ',' DCL
+        {
+            $$ = $1;
+            for (size_t i = 0; i < $3->names.size(); ++i) {
+                $$->paramNames.push_back($3->names[i]);
+                $$->paramTypes.push_back($3->type);
             }
         }
-    }
-    ;
-
-FDEFS : FDEFS FUNC_DEF_START BLK M {
-        buffer->backpatch($3->nextList, $4->quad);
-        // Implicit Return Epilogue
-        buffer->emit("COPYI I2 I1");    // SP = FP
-        buffer->emit("LOADI I7 I1 -4"); // Restore RA
-        buffer->emit("LOADI I1 I1 -8"); // Restore Old FP (Fix: -8, not 0)
-        buffer->emit("RETRN");
-        
-        symbolTable.clear();
-        scopeVarNames.clear();
-        currentScopeRegsNum = 10; 
-        regTypes.assign(200, void_t);
-    }
-    | FDEFS FUNC_HEADER ';' {
-        symbolTable.clear();
-        scopeVarNames.clear();
-        currentScopeRegsNum = 10; 
-        regTypes.assign(200, void_t);
-    }
-    | /* EPSILON */ { }
-    ;
-
-FUNC_HEADER : TYPE TID '(' M FUNC_ARGS ')' {
-        string name = $2->str;
-        
-        if (name == "main" && $1->type != void_t) {
-            printSemanticError("incompatible return type of main function");
-        }
-        
-        if (functionTable.find(name) != functionTable.end()) {
-             Function& f = functionTable[name];
-             if ($1->type != f.returnType) printSemanticError("conflicting return type for '" + name + "'");
-             if ($5->paramTypes.size() != f.paramTypes.size()) printSemanticError("conflicting number of arguments for '" + name + "'");
-             for(size_t i=0; i<f.paramTypes.size(); ++i) {
-                 if(f.paramTypes[i] != $5->paramTypes[i]) printSemanticError("conflicting types for '" + name + "'");
-             }
-        } else {
-             Function f;
-             f.returnType = $1->type;
-             f.paramTypes = $5->paramTypes;
-             f.paramNames = $5->paramNames;
-             f.defined = false; 
-             f.startLineImplementation = 0;
-             functionTable[name] = f;
-        }
-        
-        currentReturnType = $1->type;
-        currentScopeOffset = 0; 
-        
-        $$ = new Node();
-        $$->str = name;
-    }
-    ;
-
-FUNC_DEF_START : FUNC_HEADER {
-        string name = $1->str;
-        Function& f = functionTable[name];
-        
-        if (f.defined) {
-             printSemanticError("redefinition of function '" + name + "'");
-        }
-        f.defined = true;
-        f.startLineImplementation = buffer->nextquad();
-        
-        // Prologue
-        // FP points to top of stack (after Header).
-        // Header: [OldFP] at -8, [RA] at -4.
-        buffer->emit("STORI I1 I2 0"); // Save Old FP
-        buffer->emit("STORI I7 I2 4"); // Save RA
-        buffer->emit("ADD2I I2 I2 8"); // Bump SP
-        buffer->emit("COPYI I1 I2");   // FP = SP
-        
-        $$ = $1;
-    }
-    ;
-
-FUNC_ARGS : FUNC_ARGLIST {
-        int nParams = $1->paramNames.size();
-        scopeVarNames.push_back(vector<string>()); 
-        
-        for(int i=0; i<nParams; ++i) {
-            string pname = $1->paramNames[i];
-            Type ptype = $1->paramTypes[i];
-            
-            if(find(scopeVarNames.back().begin(), scopeVarNames.back().end(), pname) != scopeVarNames.back().end()) {
-                printSemanticError("redefinition of parameter '" + pname + "'");
-            }
-            scopeVarNames.back().push_back(pname);
-            
-            Symbol s;
-            s.type = ptype;
-            // Param Offset: -12 - (N - 1 - i)*4
-            s.offset = -12 - (nParams - 1 - i) * 4;
-            
-            symbolTable[pname].push_back(s);
-        }
-        $$ = $1; 
-    }
-    | /* EPSILON */ { 
-        scopeVarNames.push_back(vector<string>());
-        $$ = new Node();
-    }
-    ;
-
-FUNC_ARGLIST : FUNC_ARGLIST ',' DCL {
-        $$ = $1;
-        for(size_t i=0; i<$3->paramNames.size(); ++i) {
-            $$->paramNames.push_back($3->paramNames[i]);
-            $$->paramTypes.push_back($3->paramTypes[i]);
-        }
-    }
-    | DCL {
-        $$ = $1;
-    }
-    ;
-
-DCL : TID ':' TYPE {
-        if($3->type == void_t) printSemanticError("variable has incompatible type 'void'");
-        $$ = new Node();
-        $$->paramNames.push_back($1->str);
-        $$->paramTypes.push_back($3->type);
-    }
-    | TID ',' DCL {
-        $$ = $3;
-        $$->paramNames.insert($$->paramNames.begin(), $1->str);
-        $$->paramTypes.insert($$->paramTypes.begin(), $3->paramTypes[0]); 
-    }
-    ;
-
-TYPE : TINT { $$ = new Node(); $$->type = int_t; }
-     | TFLOAT { $$ = new Node(); $$->type = float_type; }
-     | TVOID { $$ = new Node(); $$->type = void_t; }
-     ;
-
-BLK : '{' BLK_OPEN STLIST M BLK_CLOSE '}' {
-        buffer->backpatch($3->nextList, $4->quad);
-        $$ = $3; 
-    }
-    ;
-
-BLK_OPEN : /* EPSILON */ {
-        currentBlockDepth++;
-        scopeVarNames.push_back(vector<string>());
-        $$ = new Node();
-    }
-    ;
-
-BLK_CLOSE : /* EPSILON */ {
-        vector<string>& currentVars = scopeVarNames.back();
-        for(size_t i=0; i<currentVars.size(); ++i) {
-            symbolTable[currentVars[i]].pop_back();
-            if(symbolTable[currentVars[i]].empty()) {
-                symbolTable.erase(currentVars[i]);
+    | DCL
+        {
+            $$ = new Attr();
+            for (size_t i = 0; i < $1->names.size(); ++i) {
+                $$->paramNames.push_back($1->names[i]);
+                $$->paramTypes.push_back($1->type);
             }
         }
-        scopeVarNames.pop_back();
-        currentBlockDepth--;
-        $$ = new Node();
-    }
     ;
 
-STLIST : STLIST M STMT {
-        buffer->backpatch($1->nextList, $2->quad);
-        $$ = new Node();
-        $$->nextList = $3->nextList;
-    }
-    | /* EPSILON */ { $$ = new Node(); }
+DCL
+    : TK_ID ':' TYPE
+        {
+            $$ = new Attr();
+            $$->type = $3->type;
+            $$->names.push_back($1->str);
+        }
+    | TK_ID ',' DCL
+        {
+            $$ = $3;
+            $$->names.insert($$->names.begin(), $1->str);
+        }
     ;
 
-STMT : DCL ';' {
-        for(size_t i=0; i<$1->paramNames.size(); ++i) {
-            string name = $1->paramNames[i];
-            Type type = $1->paramTypes[i];
-            
-            vector<string>& vars = scopeVarNames.back();
-            if(find(vars.begin(), vars.end(), name) != vars.end()) {
-                printSemanticError("repeated declaration of identifier '" + name + "'");
+BLK
+    : '{' BLK_BEGIN STLIST '}' BLK_END
+        {
+            $$ = $3;
+        }
+    ;
+
+BLK_BEGIN
+    : /* empty */
+        {
+            pushScope();
+            g_blockDepth++;
+            if (g_blockDepth == 1) {
+                insertParamsIntoCurrentScope();
             }
-            vars.push_back(name);
-            
-            Symbol s;
-            s.type = type;
-            s.offset = currentScopeOffset; 
-            symbolTable[name].push_back(s);
-            
-            buffer->emit("ADD2I I2 I2 4"); 
-            currentScopeOffset += 4;
+            $$ = new Attr();
         }
-        $$ = new Node();
-    }
-    | ASSN { $$ = new Node(); }
-    | EXP ';' { $$ = new Node(); }
-    | CNTRL { $$ = $1; }
-    | READ { $$ = new Node(); }
-    | WRITE { $$ = new Node(); }
-    | RETURN { $$ = new Node(); }
-    | BLK { $$ = $1; }
     ;
 
-ASSN : LVAL TASSIGN EXP ';' {
-        if ($1->type != $3->type) printSemanticError("type mismatch in assignment");
-        if ($1->type == void_t) printSemanticError("cannot assign to void");
-        
-        string storeCmd = ($1->type == int_t) ? "STORI" : "STORF";
-        string regPrefix = ($1->type == int_t) ? "I" : "F";
-        
-        buffer->emit(storeCmd + " " + regPrefix + intToString($3->regNum) + " I1 " + intToString($1->offset));
-        $$ = new Node();
-    }
-    ;
-
-LVAL : TID {
-        if(symbolTable.find($1->str) == symbolTable.end()) printSemanticError("undeclared identifier '" + $1->str + "'");
-        Symbol s = symbolTable[$1->str].back();
-        $$ = new Node();
-        $$->type = s.type;
-        $$->offset = s.offset;
-        $$->str = $1->str;
-    }
-    ;
-
-CNTRL : TIF BEXP TTHEN M STMT TELSE N M STMT {
-        buffer->backpatch($2->trueList, $4->quad);
-        buffer->backpatch($2->falseList, $8->quad);
-        $$ = new Node();
-        $$->nextList = merge($5->nextList, $6->nextList); 
-        $$->nextList = merge($$->nextList, $9->nextList);
-    }
-    | TIF BEXP TTHEN M STMT %prec TIF_NO_ELSE {
-        buffer->backpatch($2->trueList, $4->quad);
-        $$ = new Node();
-        $$->nextList = merge($2->falseList, $5->nextList);
-    }
-    | TWHILE M BEXP TDO M STMT {
-        buffer->backpatch($3->trueList, $5->quad);
-        buffer->backpatch($6->nextList, $2->quad); 
-        buffer->emit("UJUMP " + intToString($2->quad));
-        $$ = new Node();
-        $$->nextList = $3->falseList;
-    }
-    ;
-
-BEXP : BEXP TOR M BEXP {
-        buffer->backpatch($1->falseList, $3->quad);
-        $$ = new Node();
-        $$->trueList = merge($1->trueList, $4->trueList);
-        $$->falseList = $4->falseList;
-    }
-    | BEXP TAND M BEXP {
-        buffer->backpatch($1->trueList, $3->quad);
-        $$ = new Node();
-        $$->falseList = merge($1->falseList, $4->falseList);
-        $$->trueList = $4->trueList;
-    }
-    | TNOT BEXP {
-        $$ = new Node();
-        $$->trueList = $2->falseList;
-        $$->falseList = $2->trueList;
-    }
-    | EXP TRELOP EXP {
-        if ($1->type != $3->type) printSemanticError("type mismatch in comparison");
-        if ($1->type == void_t) printSemanticError("void in comparison");
-        
-        int r = nextReg(int_t);
-        string op = $2->str;
-        string branch;
-        bool isFloat = ($1->type == float_type);
-        string suffix = isFloat ? "F" : "I";
-        string opCode;
-        
-        if (op == "==") opCode = "SEQU";
-        else if (op == "<>") opCode = "SNEQ";
-        else if (op == "<") opCode = "SLET";
-        else if (op == "<=") opCode = "SLET"; 
-        else if (op == ">") opCode = "SGRT";
-        else if (op == ">=") opCode = "SGRT"; 
-        
-        string prefix = isFloat ? "F" : "I";
-        string reg1 = prefix + intToString($1->regNum);
-        string reg2 = prefix + intToString($3->regNum);
-        string destReg = (isFloat ? "F" : "I") + intToString(r);
-        int resReg = r;
-        
-        if (op == "<=") {
-            buffer->emit("SGRT" + suffix + " " + destReg + " " + reg1 + " " + reg2); 
-            branch = "BREQZ"; 
-        } else if (op == ">=") {
-            buffer->emit("SLET" + suffix + " " + destReg + " " + reg1 + " " + reg2); 
-            branch = "BREQZ";
-        } else {
-            buffer->emit(opCode + suffix + " " + destReg + " " + reg1 + " " + reg2);
-            branch = "BNEQZ";
+BLK_END
+    : /* empty */
+        {
+            popScope();
+            g_blockDepth--;
+            $$ = new Attr();
         }
-
-        if (isFloat) {
-             int iReg = nextReg(int_t);
-             buffer->emit("CFTOI I" + intToString(iReg) + " " + destReg);
-             resReg = iReg;
-        }
-
-        $$ = new Node();
-        $$->trueList.push_back(buffer->nextquad());
-        buffer->emit(branch + " I" + intToString(resReg) + " ");
-        $$->falseList.push_back(buffer->nextquad());
-        buffer->emit("UJUMP ");
-    }
-    | '(' BEXP ')' { $$ = $2; }
     ;
 
-EXP : EXP TADDOP EXP {
-        if ($1->type != $3->type) printSemanticError("type mismatch in arithmetic");
-        if ($1->type == void_t) printSemanticError("void in arithmetic");
-        
-        $$ = new Node();
-        $$->type = $1->type;
-        $$->regNum = nextReg($$->type);
-        
-        string op = $2->str;
-        string inst = (op == "+") ? "ADD2" : "SUBT";
-        string prefix = ($$->type == int_t) ? "I" : "F";
-        string suffix = ($$->type == int_t) ? "I" : "F";
-        
-        buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
-    }
-    | EXP TMULOP EXP {
-        if ($1->type != $3->type) printSemanticError("type mismatch in arithmetic");
-        if ($1->type == void_t) printSemanticError("void in arithmetic");
-        
-        $$ = new Node();
-        $$->type = $1->type;
-        $$->regNum = nextReg($$->type);
-        
-        string op = $2->str;
-        string inst = (op == "*") ? "MULT" : "DIVD";
-        string prefix = ($$->type == int_t) ? "I" : "F";
-        string suffix = ($$->type == int_t) ? "I" : "F";
-        
-        buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
-    }
-    | '(' TYPE ')' EXP {
-        if ($2->type == $4->type) {
-            $$ = $4;
-        } else if ($2->type == int_t && $4->type == float_type) {
-            $$ = new Node();
-            $$->type = int_t;
-            $$->regNum = nextReg(int_t);
-            buffer->emit("CFTOI I" + intToString($$->regNum) + " F" + intToString($4->regNum));
-        } else if ($2->type == float_type && $4->type == int_t) {
-            $$ = new Node();
-            $$->type = float_type;
-            $$->regNum = nextReg(float_type);
-            buffer->emit("CITOF F" + intToString($$->regNum) + " I" + intToString($4->regNum));
-        } else {
-            printSemanticError("invalid cast");
+STLIST
+    : STLIST M STMT
+        {
+            g_code.backpatch($1->nextList, $2->quad);
+            $$ = new Attr();
+            $$->nextList = $3->nextList;
         }
-    }
-    | TID {
-        if(symbolTable.find($1->str) == symbolTable.end()) printSemanticError("undeclared identifier '" + $1->str + "'");
-        Symbol s = symbolTable[$1->str].back();
-        $$ = new Node();
-        $$->type = s.type;
-        $$->regNum = nextReg(s.type);
-        
-        string regPrefix = ($$->type == int_t) ? "I" : "F";
-        string loadCmd = ($$->type == int_t) ? "LOADI" : "LOADF";
-        buffer->emit(loadCmd + " " + regPrefix + intToString($$->regNum) + " I1 " + intToString(s.offset));
-    }
-    | TNUM {
-        $$ = new Node();
-        $$->type = int_t;
-        $$->regNum = nextReg(int_t);
-        buffer->emit("COPYI I" + intToString($$->regNum) + " " + $1->str);
-    }
-    | TREAL {
-        $$ = new Node();
-        $$->type = float_type;
-        $$->regNum = nextReg(float_type);
-        buffer->emit("COPYF F" + intToString($$->regNum) + " " + $1->str);
-    }
-    | CALL { $$ = $1; }
-    | '(' EXP ')' { $$ = $2; }
+    | /* empty */
+        {
+            $$ = new Attr();
+        }
     ;
 
-CALL : TID '(' CALL_ARGS ')' {
-        string fname = $1->str;
-        if(functionTable.find(fname) == functionTable.end()) printSemanticError("undefined function '" + fname + "'");
-        Function& f = functionTable[fname];
-        
-        vector<Type> actualTypes = $3->paramTypes;
-        vector<string> namedLabels = $3->namedLabels;
-        vector<int> actualRegs = $3->paramRegs;
-        
-        vector<int> orderedRegs(f.paramTypes.size(), -1);
-        vector<bool> set(f.paramTypes.size(), false);
-        
-        size_t positionalCount = 0; 
-        for(size_t i=0; i<actualTypes.size(); ++i) {
-            if(namedLabels[i] == "") {
-                if(positionalCount >= f.paramTypes.size()) printSemanticError("too many arguments");
-                if(set[positionalCount]) printSemanticError("duplicate argument");
-                if(actualTypes[i] != f.paramTypes[positionalCount]) printSemanticError("type mismatch arg");
-                orderedRegs[positionalCount] = actualRegs[i];
-                set[positionalCount] = true;
-                positionalCount++;
+M
+    : /* empty */
+        {
+            $$ = new Attr();
+            $$->quad = g_code.nextQuad();
+        }
+    ;
+
+N
+    : /* empty */
+        {
+            $$ = new Attr();
+            $$->nextList = vector<int>{g_code.nextQuad()};
+            g_code.emit("UJUMP ");
+        }
+    ;
+
+STMT
+    : DCL ';'
+        {
+            for (const auto& name : $1->names) {
+                declareLocal(name, $1->type);
+            }
+            $$ = new Attr();
+            resetTemps();
+        }
+    | ASSN
+        {
+            $$ = new Attr();
+            resetTemps();
+        }
+    | EXP ';'
+        {
+            if ($1->type != void_t) {
+                semanticError("expression statement must have type void");
+            }
+            $$ = new Attr();
+            resetTemps();
+        }
+    | CNTRL
+        {
+            $$ = $1;
+            resetTemps();
+        }
+    | READ
+        {
+            $$ = new Attr();
+            resetTemps();
+        }
+    | WRITE
+        {
+            $$ = new Attr();
+            resetTemps();
+        }
+    | RETURN
+        {
+            $$ = new Attr();
+            resetTemps();
+        }
+    | BLK
+        {
+            $$ = $1;
+            resetTemps();
+        }
+    ;
+
+ASSN
+    : LVAL TK_ASSIGN EXP ';'
+        {
+            if ($1->type == void_t || $3->type == void_t) {
+                semanticError("cannot assign void");
+            }
+            if ($1->type != $3->type) {
+                semanticError("type mismatch in assignment");
+            }
+            if ($1->type == int_) {
+                g_code.emit("STORI " + Ireg($3->reg) + " I1 " + std::to_string($1->offset));
+            } else {
+                g_code.emit("STORF " + Freg($3->reg) + " I1 " + std::to_string($1->offset));
+            }
+            $$ = new Attr();
+        }
+    ;
+
+LVAL
+    : TK_ID
+        {
+            VarBinding vb = lookupVar($1->str);
+            $$ = new Attr();
+            $$->str = $1->str;
+            $$->type = vb.type;
+            $$->offset = vb.offset;
+        }
+    ;
+
+READ
+    : TK_READ '(' LVAL ')' ';'
+        {
+            if ($3->type == void_t) {
+                semanticError("cannot read into void");
+            }
+            if ($3->type == int_) {
+                const int r = allocIntReg();
+                g_code.emit("READI " + Ireg(r));
+                g_code.emit("STORI " + Ireg(r) + " I1 " + std::to_string($3->offset));
+            } else {
+                const int r = allocFloatReg();
+                g_code.emit("READF " + Freg(r));
+                g_code.emit("STORF " + Freg(r) + " I1 " + std::to_string($3->offset));
+            }
+            $$ = new Attr();
+        }
+    ;
+
+WRITE
+    : TK_WRITE '(' EXP ')' ';'
+        {
+            if ($3->type == int_) {
+                g_code.emit("PRNTI " + Ireg($3->reg));
+            } else if ($3->type == float_) {
+                g_code.emit("PRNTF " + Freg($3->reg));
+            } else {
+                semanticError("write() expects an int or float expression");
+            }
+            $$ = new Attr();
+        }
+    | TK_WRITE '(' TK_STR ')' ';'
+        {
+            emitPrintString($3->str);
+            $$ = new Attr();
+        }
+    ;
+
+RETURN
+    : TK_RETURN EXP ';'
+        {
+            if (g_currentReturnType == void_t) {
+                semanticError("returning a value from a void function");
+            }
+            if ($2->type != g_currentReturnType) {
+                semanticError("return type mismatch");
+            }
+            if (g_currentReturnType == int_) {
+                g_code.emit("COPYI I3 " + Ireg($2->reg));
+            } else {
+                g_code.emit("COPYF F3 " + Freg($2->reg));
+            }
+            const int j = g_code.nextQuad();
+            g_code.emit("UJUMP ");
+            g_currentReturnJumps.push_back(j);
+            $$ = new Attr();
+        }
+    | TK_RETURN ';'
+        {
+            if (g_currentReturnType != void_t) {
+                semanticError("missing return value in non-void function");
+            }
+            const int j = g_code.nextQuad();
+            g_code.emit("UJUMP ");
+            g_currentReturnJumps.push_back(j);
+            $$ = new Attr();
+        }
+    ;
+
+IF_COND
+    : TK_IF BEXP
+      {
+          resetTemps();
+          $$ = $2;
+      }
+    ;
+
+CNTRL
+    : IF_COND TK_THEN M STMT TK_ELSE N M STMT
+        {
+            g_code.backpatch($1->trueList, $3->quad);
+            g_code.backpatch($1->falseList, $7->quad);
+
+            $$ = new Attr();
+            $$->nextList = mergeLists(mergeLists($4->nextList, $6->nextList), $8->nextList);
+        }
+    | IF_COND TK_THEN M STMT %prec IF_NO_ELSE
+        {
+            g_code.backpatch($1->trueList, $3->quad);
+
+            $$ = new Attr();
+            $$->nextList = mergeLists($1->falseList, $4->nextList);
+        }
+    | TK_WHILE M BEXP { resetTemps(); } TK_DO M STMT
+        {
+            g_code.backpatch($3->trueList, $6->quad);
+            g_code.backpatch($7->nextList, $2->quad);
+            g_code.emit("UJUMP " + std::to_string($2->quad));
+            $$ = new Attr();
+            $$->nextList = $3->falseList;
+        }
+    ;
+
+BEXP
+    : BEXP TK_OR M BEXP
+        {
+            g_code.backpatch($1->falseList, $3->quad);
+            $$ = new Attr();
+            $$->trueList = mergeLists($1->trueList, $4->trueList);
+            $$->falseList = $4->falseList;
+        }
+    | BEXP TK_AND M BEXP
+        {
+            g_code.backpatch($1->trueList, $3->quad);
+            $$ = new Attr();
+            $$->trueList = $4->trueList;
+            $$->falseList = mergeLists($1->falseList, $4->falseList);
+        }
+    | TK_NOT BEXP
+        {
+            $$ = new Attr();
+            $$->trueList = $2->falseList;
+            $$->falseList = $2->trueList;
+        }
+    | EXP TK_RELOP EXP
+        {
+            if ($1->type == void_t || $3->type == void_t) {
+                semanticError("void value used in a relational expression");
+            }
+            if ($1->type != $3->type) {
+                semanticError("type mismatch in relational expression");
+            }
+
+            const string& op = $2->str;
+
+            // We branch on an INT condition register.
+            int condI = -1;
+
+            if ($1->type == int_) {
+                condI = allocIntReg();
+
+                if (op == "==")      g_code.emit("SEQUI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == "<>") g_code.emit("SNEQI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == "<")  g_code.emit("SLETI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == ">")  g_code.emit("SGRTI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == "<=") g_code.emit("SGRTI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else if (op == ">=") g_code.emit("SLETI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
+                else semanticError("unknown relop '" + op + "'");
+            } else {
+                // Float comparisons: *_F instructions require float registers, including destination.
+                const int condF = allocFloatReg();
+
+                if (op == "==")      g_code.emit("SEQUF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == "<>") g_code.emit("SNEQF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == "<")  g_code.emit("SLETF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == ">")  g_code.emit("SGRTF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == "<=") g_code.emit("SGRTF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else if (op == ">=") g_code.emit("SLETF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
+                else semanticError("unknown relop '" + op + "'");
+
+                // Convert 0/1 float result to an int register for branching.
+                condI = allocIntReg();
+                g_code.emit("CFTOI " + Ireg(condI) + " " + Freg(condF));
+            }
+
+            // For <= and >= we computed the *opposite* condition (>): true if cond==0.
+            const bool trueOnZero = (op == "<=" || op == ">=");
+
+            $$ = new Attr();
+            const int bline = g_code.nextQuad();
+            if (trueOnZero) {
+                g_code.emit("BREQZ " + Ireg(condI) + " ");
+            } else {
+                g_code.emit("BNEQZ " + Ireg(condI) + " ");
+            }
+            $$->trueList.push_back(bline);
+
+            const int jline = g_code.nextQuad();
+            g_code.emit("UJUMP ");
+            $$->falseList.push_back(jline);
+        }
+    | '(' BEXP ')'
+        {
+            $$ = $2;
+        }
+    ;
+
+EXP
+    : EXP TK_ADDOP EXP
+        {
+            if ($1->type == void_t || $3->type == void_t) {
+                semanticError("void value used in arithmetic expression");
+            }
+            if ($1->type != $3->type) {
+                semanticError("type mismatch in arithmetic expression");
+            }
+
+            const string& op = $2->str;
+            $$ = new Attr();
+            $$->type = $1->type;
+
+            if ($1->type == int_) {
+                const int dst = $1->reg;
+                if (op == "+")      g_code.emit("ADD2I " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
+                else if (op == "-") g_code.emit("SUBTI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
+                else semanticError("unknown addop '" + op + "'");
+                $$->reg = dst;
+            } else {
+                const int dst = $1->reg;
+                if (op == "+")      g_code.emit("ADD2F " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
+                else if (op == "-") g_code.emit("SUBTF " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
+                else semanticError("unknown addop '" + op + "'");
+                $$->reg = dst;
             }
         }
-        
-        for(size_t i=0; i<actualTypes.size(); ++i) {
-            if(namedLabels[i] != "") {
-                string lbl = namedLabels[i];
-                int idx = -1;
-                for(size_t j=0; j<f.paramNames.size(); ++j) {
-                    if(f.paramNames[j] == lbl) { idx = j; break; }
+    | EXP TK_MULOP EXP
+        {
+            if ($1->type == void_t || $3->type == void_t) {
+                semanticError("void value used in arithmetic expression");
+            }
+            if ($1->type != $3->type) {
+                semanticError("type mismatch in arithmetic expression");
+            }
+
+            const string& op = $2->str;
+            $$ = new Attr();
+            $$->type = $1->type;
+
+            if ($1->type == int_) {
+                const int dst = $1->reg;
+                if (op == "*")      g_code.emit("MULTI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
+                else if (op == "/") g_code.emit("DIVDI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
+                else semanticError("unknown mulop '" + op + "'");
+                $$->reg = dst;
+            } else {
+                const int dst = $1->reg;
+                if (op == "*")      g_code.emit("MULTF " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
+                else if (op == "/") g_code.emit("DIVDF " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
+                else semanticError("unknown mulop '" + op + "'");
+                $$->reg = dst;
+            }
+        }
+    | TK_NOT EXP
+        {
+            if ($2->type == void_t) {
+                semanticError("void value used with '!'");
+            }
+            // !exp returns int: 1 if exp == 0 else 0
+            $$ = new Attr();
+            $$->type = int_;
+
+            if ($2->type == int_) {
+                const int r = $2->reg;
+                g_code.emit("SEQUI " + Ireg(r) + " " + Ireg(r) + " 0");
+                $$->reg = r;
+            } else {
+                // Float: compare in float regs, then convert 0/1 float to int
+                const int tmpF = allocFloatReg();
+                g_code.emit("SEQUF " + Freg(tmpF) + " " + Freg($2->reg) + " 0.0");
+                const int r = allocIntReg();
+                g_code.emit("CFTOI " + Ireg(r) + " " + Freg(tmpF));
+                $$->reg = r;
+            }
+        }
+    | TK_ID
+        {
+            VarBinding vb = lookupVar($1->str);
+            $$ = new Attr();
+            $$->type = vb.type;
+            $$->offset = vb.offset;
+
+            if (vb.type == int_) {
+                const int r = allocIntReg();
+                g_code.emit("LOADI " + Ireg(r) + " I1 " + std::to_string(vb.offset));
+                $$->reg = r;
+            } else if (vb.type == float_) {
+                const int r = allocFloatReg();
+                g_code.emit("LOADF " + Freg(r) + " I1 " + std::to_string(vb.offset));
+                $$->reg = r;
+            } else {
+                semanticError("void variable used as a value");
+            }
+        }
+    | CALL
+        {
+            $$ = $1;
+        }
+    | NUM
+        {
+            $$ = $1;
+        }
+    | '(' EXP ')'
+        {
+            $$ = $2;
+        }
+    | '(' TYPE ')' EXP %prec TK_CAST
+        {
+            const Type toT = $2->type;
+            const Type fromT = $4->type;
+
+            if (toT == void_t) {
+                $$ = new Attr();
+                $$->type = void_t;
+                $$->reg = -1;
+            } else {
+                if (fromT == void_t) {
+                    semanticError("cannot cast void to a non-void type");
                 }
-                if(idx == -1) printSemanticError("unknown named argument '" + lbl + "'");
-                if(set[idx]) printSemanticError("duplicate argument '" + lbl + "'");
-                if(actualTypes[i] != f.paramTypes[idx]) printSemanticError("type mismatch arg '" + lbl + "'");
-                orderedRegs[idx] = actualRegs[i];
-                set[idx] = true;
+                if (toT == fromT) {
+                    $$ = $4;
+                } else if (toT == int_ && fromT == float_) {
+                    $$ = new Attr();
+                    $$->type = int_;
+                    const int r = allocIntReg();
+                    g_code.emit("CFTOI " + Ireg(r) + " " + Freg($4->reg));
+                    $$->reg = r;
+                } else if (toT == float_ && fromT == int_) {
+                    $$ = new Attr();
+                    $$->type = float_;
+                    const int r = allocFloatReg();
+                    g_code.emit("CITOF " + Freg(r) + " " + Ireg($4->reg));
+                    $$->reg = r;
+                } else {
+                    semanticError("unsupported cast");
+                }
             }
         }
-        
-        for(size_t i=0; i<f.paramTypes.size(); ++i) {
-            if(!set[i]) printSemanticError("missing argument for '" + f.paramNames[i] + "'");
-        }
+    ;
 
-        // SAVE REGISTERS
-        int savedCount = 0;
-        for(int i=10; i<currentScopeRegsNum; ++i) {
-            if (regTypes[i] == int_t) {
-                buffer->emit("STORI I" + intToString(i) + " I2 " + intToString(savedCount*4));
-            } else if (regTypes[i] == float_type) {
-                buffer->emit("STORF F" + intToString(i) + " I2 " + intToString(savedCount*4));
+NUM
+    : TK_INTEGERNUM
+        {
+            $$ = $1;
+            $$->type = int_;
+            const int r = allocIntReg();
+            g_code.emit("COPYI " + Ireg(r) + " " + $1->str);
+            $$->reg = r;
+        }
+    | TK_REALNUM
+        {
+            $$ = $1;
+            $$->type = float_;
+            const int r = allocFloatReg();
+            g_code.emit("COPYF " + Freg(r) + " " + $1->str);
+            $$->reg = r;
+        }
+    ;
+
+CALL
+    : TK_ID '(' CALL_ARGS ')'
+        {
+            const string fname = $1->str;
+            auto fit = g_functions.find(fname);
+            if (fit == g_functions.end()) {
+                semanticError("call to function '" + fname + "' without prior declaration");
             }
-            savedCount++;
-        }
-        buffer->emit("ADD2I I2 I2 " + intToString(savedCount * 4));
-        
-        // PUSH ARGUMENTS
-        for(size_t i=0; i<orderedRegs.size(); ++i) {
-            Type t = f.paramTypes[i];
-            string p = (t==int_t) ? "I" : "F";
-            buffer->emit("STOR" + p + " " + p + intToString(orderedRegs[i]) + " I2 0");
-            buffer->emit("ADD2I I2 I2 4");
-        }
-        
-        int callQuad = buffer->nextquad();
-        buffer->emit("JLINK ");
-        if(!f.defined) {
-            functionTable[fname].callingLines.push_back(callQuad);
-        } else {
-            buffer->backpatch(vector<int>(1, callQuad), f.startLineImplementation);
-        }
-        
-        // CLEANUP ARGUMENTS
-        buffer->emit("SUBTI I2 I2 " + intToString(orderedRegs.size() * 4));
-        
-        // RESTORE REGISTERS
-        buffer->emit("SUBTI I2 I2 " + intToString(savedCount * 4));
-        int restoreCount = 0;
-        for(int i=10; i<currentScopeRegsNum; ++i) {
-            if (regTypes[i] == int_t) {
-                buffer->emit("LOADI I" + intToString(i) + " I2 " + intToString(restoreCount*4));
-            } else if (regTypes[i] == float_type) {
-                buffer->emit("LOADF F" + intToString(i) + " I2 " + intToString(restoreCount*4));
+
+            const FunctionInfo& finfo = fit->second;
+            const int nparams = static_cast<int>(finfo.paramTypes.size());
+
+            const int npos = static_cast<int>($3->posTypes.size());
+            if (npos > nparams) {
+                semanticError("too many positional arguments in call to '" + fname + "'");
             }
-            restoreCount++;
+
+            vector<bool> provided(static_cast<size_t>(nparams), false);
+            vector<Type> argTypes(static_cast<size_t>(nparams), void_t);
+            vector<int> argRegs(static_cast<size_t>(nparams), -1);
+
+            for (int i = 0; i < npos; ++i) {
+                provided[i] = true;
+                argTypes[i] = $3->posTypes[i];
+                argRegs[i] = $3->posRegs[i];
+            }
+
+            for (size_t j = 0; j < $3->namedNames.size(); ++j) {
+                const string& label = $3->namedNames[j];
+
+                int idx = -1;
+                for (int k = 0; k < nparams; ++k) {
+                    if (finfo.paramNames[k] == label) {
+                        idx = k;
+                        break;
+                    }
+                }
+                if (idx < 0) {
+                    semanticError("unknown named argument '" + label + "' in call to '" + fname + "'");
+                }
+                if (idx < npos) {
+                    semanticError("named argument '" + label + "' duplicates a positional argument in call to '" + fname + "'");
+                }
+                if (provided[idx]) {
+                    semanticError("duplicate named argument '" + label + "' in call to '" + fname + "'");
+                }
+
+                provided[idx] = true;
+                argTypes[idx] = $3->namedTypes[j];
+                argRegs[idx] = $3->namedRegs[j];
+            }
+
+            for (int i = 0; i < nparams; ++i) {
+                if (!provided[i]) {
+                    semanticError("missing argument for parameter '" + finfo.paramNames[i] + "' in call to '" + fname + "'");
+                }
+                if (argTypes[i] != finfo.paramTypes[i]) {
+                    semanticError("type mismatch for parameter '" + finfo.paramNames[i] + "' in call to '" + fname + "'");
+                }
+            }
+
+            const int intTempsUsed = g_nextIntReg - INT_TMP_BASE;
+            const int floatTempsUsed = g_nextFloatReg - FLOAT_TMP_BASE;
+            const int saveCount = intTempsUsed + floatTempsUsed;
+            const int saveSize = 4 * saveCount;
+            const int argSize = 4 * nparams;
+
+            if (saveSize > 0) {
+                int offset = 0;
+                for (int r = INT_TMP_BASE; r < g_nextIntReg; ++r) {
+                    g_code.emit("STORI " + Ireg(r) + " I2 " + std::to_string(offset));
+                    offset += 4;
+                }
+                for (int r = FLOAT_TMP_BASE; r < g_nextFloatReg; ++r) {
+                    g_code.emit("STORF " + Freg(r) + " I2 " + std::to_string(offset));
+                    offset += 4;
+                }
+                g_code.emit("ADD2I I2 I2 " + std::to_string(saveSize));
+            }
+
+            for (int i = 0; i < nparams; ++i) {
+                if (finfo.paramTypes[i] == int_) {
+                    g_code.emit("STORI " + Ireg(argRegs[i]) + " I2 0");
+                } else {
+                    g_code.emit("STORF " + Freg(argRegs[i]) + " I2 0");
+                }
+                g_code.emit("ADD2I I2 I2 4");
+            }
+
+            const int callLine = g_code.nextQuad();
+            g_code.emit("JLINK ");
+
+            g_functions[fname].callLines.push_back(callLine);
+
+            if (finfo.isDefined) {
+                g_code.backpatch(vector<int>{callLine}, finfo.startLineImplementation);
+            } else {
+                g_functions[fname].unresolvedCallLines.push_back(callLine);
+            }
+
+            if (argSize > 0) {
+                g_code.emit("SUBTI I2 I2 " + std::to_string(argSize));
+            }
+
+            if (saveSize > 0) {
+                g_code.emit("SUBTI I4 I2 " + std::to_string(saveSize));
+
+                int offset = 0;
+                for (int r = INT_TMP_BASE; r < g_nextIntReg; ++r) {
+                    g_code.emit("LOADI " + Ireg(r) + " I4 " + std::to_string(offset));
+                    offset += 4;
+                }
+                for (int r = FLOAT_TMP_BASE; r < g_nextFloatReg; ++r) {
+                    g_code.emit("LOADF " + Freg(r) + " I4 " + std::to_string(offset));
+                    offset += 4;
+                }
+
+                g_code.emit("SUBTI I2 I2 " + std::to_string(saveSize));
+            }
+
+            $$ = new Attr();
+            $$->type = finfo.returnType;
+            if (finfo.returnType == int_) {
+                const int r = allocIntReg();
+                g_code.emit("COPYI " + Ireg(r) + " I3");
+                $$->reg = r;
+            } else if (finfo.returnType == float_) {
+                const int r = allocFloatReg();
+                g_code.emit("COPYF " + Freg(r) + " F3");
+                $$->reg = r;
+            } else {
+                $$->reg = -1;
+            }
         }
-        
-        $$ = new Node();
-        $$->type = f.returnType;
-        $$->regNum = nextReg($$->type);
-        
-        if(f.returnType != void_t) {
-            string p = (f.returnType == int_t) ? "I" : "F";
-            buffer->emit("COPY" + p + " " + p + intToString($$->regNum) + " " + p + "0");
-        }
-    }
     ;
 
-CALL_ARGS : CALL_ARGS_LIST { $$ = $1; }
-          | /* EPSILON */ { $$ = new Node(); }
-          ;
-
-CALL_ARGS_LIST : CALL_ARG_ITEM { $$ = $1; }
-           | CALL_ARGS_LIST ',' CALL_ARG_ITEM {
-               $$ = $1;
-               $$->namedLabels.push_back($3->namedLabels[0]);
-               $$->paramTypes.push_back($3->paramTypes[0]);
-               $$->paramRegs.push_back($3->paramRegs[0]);
-           }
-           ;
-
-CALL_ARG_ITEM : EXP {
-              $$ = new Node();
-              $$->namedLabels.push_back("");
-              $$->paramTypes.push_back($1->type);
-              $$->paramRegs.push_back($1->regNum);
-          }
-          | TID ':' EXP {
-              $$ = new Node();
-              $$->namedLabels.push_back($1->str);
-              $$->paramTypes.push_back($3->type);
-              $$->paramRegs.push_back($3->regNum);
-          }
-          ;
-
-WRITE : TWRITE '(' EXP ')' ';' {
-        if ($3->type == int_t) buffer->emit("PRNTI I" + intToString($3->regNum));
-        else buffer->emit("PRNTF F" + intToString($3->regNum));
-        $$ = new Node();
-    }
-    | TWRITE '(' TSTR ')' ';' {
-        string s = $3->str;
-        for(size_t i=0; i<s.length(); ++i) {
-             string val = intToString((int)s[i]);
-             if(s[i] == '\\' && i+1 < s.length()) {
-                 if(s[i+1] == 'n') val = "10";
-                 if(s[i+1] == 't') val = "9";
-                 if(s[i+1] == '"') val = "34";
-                 i++;
-             }
-             buffer->emit("PRNTC " + val);
+CALL_ARGS
+    : /* empty */
+        {
+            $$ = new Attr();
         }
-        $$ = new Node();
-    }
+    | POS_ARGLIST
+        {
+            $$ = $1;
+        }
+    | NAMED_ARGLIST
+        {
+            $$ = $1;
+        }
+    | POS_ARGLIST ',' NAMED_ARGLIST
+        {
+            $$ = new Attr();
+            $$->posTypes = $1->posTypes;
+            $$->posRegs = $1->posRegs;
+            $$->namedNames = $3->namedNames;
+            $$->namedTypes = $3->namedTypes;
+            $$->namedRegs = $3->namedRegs;
+        }
     ;
 
-READ : TREAD '(' LVAL ')' ';' {
-       if($3->type == int_t) {
-           int r = nextReg(int_t);
-           buffer->emit("READI I" + intToString(r));
-           buffer->emit("STORI I" + intToString(r) + " I1 " + intToString($3->offset));
-       } else {
-           int r = nextReg(float_type);
-           buffer->emit("READF F" + intToString(r));
-           buffer->emit("STORF F" + intToString(r) + " I1 " + intToString($3->offset));
-       }
-       $$ = new Node();
-    }
+POS_ARGLIST
+    : EXP
+        {
+            $$ = new Attr();
+            $$->posTypes.push_back($1->type);
+            $$->posRegs.push_back($1->reg);
+        }
+    | POS_ARGLIST ',' EXP
+        {
+            $$ = $1;
+            $$->posTypes.push_back($3->type);
+            $$->posRegs.push_back($3->reg);
+        }
     ;
 
-RETURN : TRET EXP ';' {
-    if(currentReturnType == void_t) printSemanticError("void function cannot return value");
-    if(currentReturnType != $2->type) printSemanticError("return type mismatch");
-    
-    string p = ($2->type == int_t) ? "I" : "F";
-    buffer->emit("COPY" + p + " " + p + "0 " + p + intToString($2->regNum));
-    
-    buffer->emit("COPYI I2 I1");
-    buffer->emit("LOADI I7 I1 -4");
-    buffer->emit("LOADI I1 I1 -8"); // Fix: -8
-    buffer->emit("RETRN");
-    $$ = new Node();
-}
-| TRET ';' {
-    if(currentReturnType != void_t) printSemanticError("non-void function must return value");
-    buffer->emit("COPYI I2 I1");
-    buffer->emit("LOADI I7 I1 -4");
-    buffer->emit("LOADI I1 I1 -8"); // Fix: -8
-    buffer->emit("RETRN");
-    $$ = new Node();
-}
-;
+NAMED_ARGLIST
+    : NAMED_ARG
+        {
+            $$ = $1;
+        }
+    | NAMED_ARGLIST ',' NAMED_ARG
+        {
+            $$ = $1;
+            $$->namedNames.push_back($3->namedNames[0]);
+            $$->namedTypes.push_back($3->namedTypes[0]);
+            $$->namedRegs.push_back($3->namedRegs[0]);
+        }
+    ;
 
-M : /* EPSILON */ { 
-    $$ = new Node();
-    $$->quad = buffer->nextquad(); 
-} ;
-N : /* EPSILON */ { 
-    $$ = new Node();
-    $$->nextList.push_back(buffer->nextquad());
-    buffer->emit("UJUMP "); 
-} ;
+NAMED_ARG
+    : TK_ID ':' EXP
+        {
+            $$ = new Attr();
+            $$->namedNames.push_back($1->str);
+            $$->namedTypes.push_back($3->type);
+            $$->namedRegs.push_back($3->reg);
+        }
+    ;
 
 %%
 
-int main(int argc, char* argv[]) {
-    if(argc != 2) {
-        printOperationalError("usage: rx-cc <file.cmm>");
+void yyerror(const char* /*s*/) {
+    const string lexeme = (yytext != nullptr && yytext[0] != '\0') ? string(yytext) : string("EOF");
+    cerr << "Syntax error: '" << lexeme << "' in line number " << yylineno << endl;
+    std::exit(SYNTAX_ERROR);
+}
+
+static string basenameNoExt(const string& path) {
+    size_t pos = path.find_last_of("/\\\\");
+    string base = (pos == string::npos) ? path : path.substr(pos + 1);
+
+    size_t dot = base.find_last_of('.');
+    if (dot == string::npos) {
+        return base;
     }
-    
-    string fname = argv[1];
-    if(fname.substr(fname.find_last_of(".") + 1) != "cmm") {
-        printOperationalError("input file must be .cmm");
+    return base.substr(0, dot);
+}
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        operationalError("usage: rx-cc <input_file.cmm>");
     }
-    
-    yyin = fopen(argv[1], "r");
-    if(!yyin) printOperationalError("cannot open input file");
-    
-    // Jump to main at start
-    buffer->emit("UJUMP ");
-    int bootQuad = 1;
-    
+
+    const string inputFile = argv[1];
+    if (inputFile.size() < 5 || inputFile.substr(inputFile.size() - 4) != ".cmm") {
+        operationalError("input file must have .cmm extension");
+    }
+
+    yyin = std::fopen(inputFile.c_str(), "r");
+    if (!yyin) {
+        operationalError("cannot open input file");
+    }
+
     yyparse();
-    fclose(yyin);
-    
-    if (functionTable.find("main") != functionTable.end()) {
-        buffer->backpatch(vector<int>(1, bootQuad), functionTable["main"].startLineImplementation);
-    } else {
-        printSemanticError("Program must have a main function");
+
+    for (auto& kv : g_functions) {
+        FunctionInfo& info = kv.second;
+        if (!info.isDefined) {
+            if (!info.unresolvedCallLines.empty()) {
+                g_code.backpatch(info.unresolvedCallLines, 0);
+                info.unresolvedCallLines.clear();
+            }
+        }
     }
-    
-    string outName = fname.substr(0, fname.find_last_of(".")) + ".rsk";
-    ofstream out(outName.c_str());
-    
-    out << "<header>" << endl;
-    
+
+    const string outBase = basenameNoExt(inputFile);
+    const string outputFile = outBase + ".rsk";
+
+    std::ofstream out(outputFile);
+    if (!out) {
+        operationalError("cannot open output file for writing");
+    }
+
     string unimpl = "<unimplemented>";
     string impl = "<implemented>";
-    
-    for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); ++it) {
-        if(it->second.defined) {
-             impl += " " + it->first + "," + intToString(it->second.startLineImplementation);
+
+    for (const auto& kv : g_functions) {
+        const string& fname = kv.first;
+        const FunctionInfo& info = kv.second;
+
+        if (info.isDefined) {
+            impl += " " + fname + "," + std::to_string(info.startLineImplementation);
         } else {
-             unimpl += " " + it->first;
-             for(size_t i=0; i<it->second.callingLines.size(); ++i) {
-                 unimpl += "," + intToString(it->second.callingLines[i]);
-             }
+            unimpl += " " + fname;
+            for (int lineNo : info.callLines) {
+                unimpl += "," + std::to_string(lineNo);
+            }
         }
     }
-    
-    out << unimpl << endl;
-    out << impl << endl;
-    out << "</header>" << endl;
-    
-    out << buffer->printBuffer();
-    out.close();
-    
-    return 0;
-}
 
-void yyerror(char const* /*s*/) {
-    cerr << "Syntax error: '" << yytext << "' in line number " << yylineno << endl;
-    exit(SYNTAX_ERROR);
+    out << "<header>\n";
+    out << unimpl << "\n";
+    out << impl << "\n";
+    out << "</header>\n";
+
+    out << g_code.str();
+
+    return 0;
 }

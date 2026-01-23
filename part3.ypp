@@ -25,11 +25,11 @@
     map<string, vector<Symbol> > symbolTable;
     
     int currentScopeOffset = 0; 
-    int currentScopeRegsNum = 3; 
+    // START ALLOCATION AT 10 to avoid I0 (RetVal), I1(FP), I2(SP), I7(RA)
+    int currentScopeRegsNum = 10; 
     Type currentReturnType = void_t;
     int currentBlockDepth = 0;
     
-    // Type tracking to prevent "Illegal regtype" errors in VM
     vector<Type> regTypes(200, void_t); 
     vector<vector<string> > scopeVarNames;
 
@@ -99,19 +99,21 @@ PROGRAM : FDEFS {
 
 FDEFS : FDEFS FUNC_DEF_START BLK M {
         buffer->backpatch($3->nextList, $4->quad);
-        buffer->emit("COPYI I2 I1");
-        buffer->emit("LOADI I1 I1 0");
+        // EPILOGUE (Implicit return)
+        buffer->emit("COPYI I2 I1");    // Restore SP
+        buffer->emit("LOADI I7 I1 -4"); // Restore RA (I7)
+        buffer->emit("LOADI I1 I1 0");  // Restore FP
         buffer->emit("RETRN");
         
         symbolTable.clear();
         scopeVarNames.clear();
-        currentScopeRegsNum = 3; 
+        currentScopeRegsNum = 10; 
         regTypes.assign(200, void_t);
     }
     | FDEFS FUNC_HEADER ';' {
         symbolTable.clear();
         scopeVarNames.clear();
-        currentScopeRegsNum = 3; 
+        currentScopeRegsNum = 10; 
         regTypes.assign(200, void_t);
     }
     | /* EPSILON */ { }
@@ -159,20 +161,18 @@ FUNC_DEF_START : FUNC_HEADER {
         f.defined = true;
         f.startLineImplementation = buffer->nextquad();
         
-        // Prologue: Save Old FP, RetAddr, update FP
-        buffer->emit("STORI I1 I2 0"); 
-        buffer->emit("STORI I0 I2 4"); 
-        buffer->emit("ADD2I I2 I2 8"); 
-        buffer->emit("COPYI I1 I2");   
+        // PROLOGUE
+        // I1 = FP, I2 = SP, I7 = RA
+        buffer->emit("STORI I1 I2 0"); // Save Old FP at [SP]
+        buffer->emit("STORI I7 I2 4"); // Save RA (I7) at [SP+4]
+        buffer->emit("ADD2I I2 I2 8"); // SP += 8
+        buffer->emit("COPYI I1 I2");   // FP = SP (New FP points after header)
         
         $$ = $1;
     }
     ;
 
 FUNC_ARGS : FUNC_ARGLIST {
-        // Stack: [Arg N] ... [Arg 1] [OldFP] [RetAddr]
-        // FP Points to top of RetAddr.
-        // Arg 1 is at -12 - (N-1)*4
         int nParams = $1->paramNames.size();
         scopeVarNames.push_back(vector<string>()); 
         
@@ -187,6 +187,11 @@ FUNC_ARGS : FUNC_ARGLIST {
             
             Symbol s;
             s.type = ptype;
+            // Args are at: FP - 8 (Header) - 4 (Last Arg) ...
+            // Caller pushes: ArgN ... Arg1.
+            // Stack: [ArgN]...[Arg1] [OldFP] [RA] <--- FP
+            // So Arg1 is at FP - 8 - 4 = FP - 12.
+            // Arg i (0-indexed) is at: -12 - (N - 1 - i)*4
             s.offset = -12 - (nParams - 1 - i) * 4;
             
             symbolTable[pname].push_back(s);
@@ -521,9 +526,9 @@ CALL : TID '(' CALL_ARGS ')' {
             if(!set[i]) printSemanticError("missing argument for '" + f.paramNames[i] + "'");
         }
 
-        // SAVE REGISTERS (Only the used ones, with correct types)
+        // SAVE REGISTERS (Start from 10)
         int savedCount = 0;
-        for(int i=3; i<currentScopeRegsNum; ++i) {
+        for(int i=10; i<currentScopeRegsNum; ++i) {
             if (regTypes[i] == int_t) {
                 buffer->emit("STORI I" + intToString(i) + " I2 " + intToString(savedCount*4));
             } else if (regTypes[i] == float_type) {
@@ -541,7 +546,6 @@ CALL : TID '(' CALL_ARGS ')' {
             buffer->emit("ADD2I I2 I2 4");
         }
         
-        // CALL
         int callQuad = buffer->nextquad();
         buffer->emit("JLINK ");
         if(!f.defined) {
@@ -556,7 +560,7 @@ CALL : TID '(' CALL_ARGS ')' {
         // RESTORE REGISTERS
         buffer->emit("SUBTI I2 I2 " + intToString(savedCount * 4));
         int restoreCount = 0;
-        for(int i=3; i<currentScopeRegsNum; ++i) {
+        for(int i=10; i<currentScopeRegsNum; ++i) {
             if (regTypes[i] == int_t) {
                 buffer->emit("LOADI I" + intToString(i) + " I2 " + intToString(restoreCount*4));
             } else if (regTypes[i] == float_type) {
@@ -569,10 +573,10 @@ CALL : TID '(' CALL_ARGS ')' {
         $$->type = f.returnType;
         $$->regNum = nextReg($$->type);
         
-        // Get return value from I11/F11
+        // RESULT in I0/F0. Copy to new reg.
         if(f.returnType != void_t) {
             string p = (f.returnType == int_t) ? "I" : "F";
-            buffer->emit("COPY" + p + " " + p + intToString($$->regNum) + " " + p + "11");
+            buffer->emit("COPY" + p + " " + p + intToString($$->regNum) + " " + p + "0");
         }
     }
     ;
@@ -643,21 +647,21 @@ RETURN : TRET EXP ';' {
     if(currentReturnType == void_t) printSemanticError("void function cannot return value");
     if(currentReturnType != $2->type) printSemanticError("return type mismatch");
     
-    // Put return value in I11/F11
+    // Put return value in I0/F0
     string p = ($2->type == int_t) ? "I" : "F";
-    buffer->emit("COPY" + p + " " + p + "11 " + p + intToString($2->regNum));
+    buffer->emit("COPY" + p + " " + p + "0 " + p + intToString($2->regNum));
     
-    buffer->emit("COPYI I2 I1");
-    buffer->emit("LOADI I0 I1 -4");
-    buffer->emit("LOADI I1 I1 -8");
+    buffer->emit("COPYI I2 I1");    // SP = FP
+    buffer->emit("LOADI I7 I1 -4"); // Restore RA
+    buffer->emit("LOADI I1 I1 0");  // Restore FP
     buffer->emit("RETRN");
     $$ = new Node();
 }
 | TRET ';' {
     if(currentReturnType != void_t) printSemanticError("non-void function must return value");
     buffer->emit("COPYI I2 I1");
-    buffer->emit("LOADI I0 I1 -4");
-    buffer->emit("LOADI I1 I1 -8");
+    buffer->emit("LOADI I7 I1 -4");
+    buffer->emit("LOADI I1 I1 0");
     buffer->emit("RETRN");
     $$ = new Node();
 }
@@ -713,6 +717,7 @@ int main(int argc, char* argv[]) {
     out << unimpl << endl;
     out << impl << endl;
     out << "</header>" << endl;
+    
     out << buffer->printBuffer();
     out.close();
     

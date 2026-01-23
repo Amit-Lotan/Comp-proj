@@ -1,41 +1,48 @@
 #include "part3_helpers.hpp"
-#include <sstream>
 
-CodeBuffer::CodeBuffer(){
-    data.clear();
+int CodeBuffer::nextQuad() const {
+    return static_cast<int>(m_lines.size()) + 1;
 }
 
-void CodeBuffer::emit(const string& str) {
-    data.push_back(str);
+void CodeBuffer::emit(const std::string& line) {
+    m_lines.push_back(line);
 }
 
-void CodeBuffer::emit_front(const string& str) {
-    data.insert(data.begin(), str);
-}
-
-void CodeBuffer::backpatch(const vector<int>& lst, int line) {
-    for (size_t i=0; i < lst.size(); ++i) {
-        int index = lst[i] - 1;
-        if(index >= 0 && (size_t)index < data.size()) {
-            data[index] += intToString(line) + " ";
+void CodeBuffer::backpatch(const std::vector<int>& lst, int label) {
+    const std::string lab = std::to_string(label);
+    for (int lineNo : lst) {
+        if (lineNo <= 0) {
+            continue;
         }
+        const size_t idx = static_cast<size_t>(lineNo - 1);
+        if (idx >= m_lines.size()) {
+            continue;
+        }
+        m_lines[idx] += lab;
     }
 }
 
-int CodeBuffer::nextquad() {
-    return data.size() + 1;
+const std::vector<std::string>& CodeBuffer::getLines() const {
+    return m_lines;
 }
 
-string CodeBuffer::printBuffer() {
-    string out = "";
-    for (size_t i=0; i<data.size(); ++i) {
-        out += data[i] + "\n";
+void CodeBuffer::patchLine(int lineNo, const std::string& newLine) {
+    if (lineNo <= 0) {
+        return;
+    }
+    const size_t idx = static_cast<size_t>(lineNo - 1);
+    if (idx >= m_lines.size()) {
+        return;
+    }
+    m_lines[idx] = newLine;
+}
+
+std::string CodeBuffer::str() const {
+    std::string out;
+    out.reserve(m_lines.size() * 16);
+    for (size_t i = 0; i < m_lines.size(); ++i) {
+        out += m_lines[i];
+        out.push_back('\n');
     }
     return out;
-}
-
-string intToString(int i) {
-    stringstream ss;
-    ss << i;
-    return ss.str();
 }

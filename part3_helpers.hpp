@@ -1,108 +1,106 @@
-/*
-    EE046266: Compilation Methods - Winter 2025-2026
-    Project Part 3 - C-- to Riski compiler (rx-cc)
-
-    This header contains small helper utilities shared by the Flex scanner
-    and the Bison parser.
-*/
-
-#ifndef PART3_HELPERS_HPP
-#define PART3_HELPERS_HPP
+#pragma once
 
 #include <string>
 #include <vector>
+#include <unordered_map>
 
-// Exit codes (as required by the project PDF)
-#define LEXICAL_ERROR     1
-#define SYNTAX_ERROR      2
-#define SEMANTIC_ERROR    3
-#define OPERATIONAL_ERROR 4
+// -----------------------------
+// Types + attributes
+// -----------------------------
+enum class Type { INT, FLOAT, VOID, STR };
 
-// Primitive types in C--
-enum Type {
-    void_t  = 0,
-    int_    = 1,
-    float_  = 2
-};
-
-// Semantic attributes object (allocated on heap; Bison/Flex pass Attr* around)
 struct Attr {
-    // Generic lexeme (ID, operators, literal numbers, string contents)
-    std::string str;
+  Type type = Type::VOID;
 
-    // Expression type
-    Type type = void_t;
+  // For EXP/LVAL temporaries
+  int reg = -1;
 
-    // Register index that holds the expression value.
-    // For int_ => I<reg>, for float_ => F<reg>, for void_t => -1
-    int reg = -1;
+  // For identifiers and strings
+  std::string str;
 
-    // Frame-pointer-relative offset in bytes for variables (LVAL / identifier
-    // expressions). Can be negative (for parameters).
-    int offset = 0;
+  // Backpatch lists
+  std::vector<int> trueList;
+  std::vector<int> falseList;
+  std::vector<int> nextList;
 
-    // Marker quad (instruction index)
-    int quad = -1;
+  // Marker quad
+  int quad = -1;
 
-    // Backpatching lists
-    std::vector<int> nextList;
-    std::vector<int> trueList;
-    std::vector<int> falseList;
+  // For function signatures
+  std::vector<Type> paramTypes;
+  std::vector<std::string> paramNames;
 
-    // DCL ids (for variable/parameter declarations)
-    std::vector<std::string> names;
+  // For call args
+  std::vector<int> argRegs;            // regs carrying each arg value
+  std::vector<std::string> argNames;   // "" for positional, name for named
 
-    // Function parameter list (names+types in order)
-    std::vector<std::string> paramNames;
-    std::vector<Type> paramTypes;
-
-    // Call arguments (positional and named)
-    std::vector<int> posRegs;
-    std::vector<Type> posTypes;
-
-    std::vector<std::string> namedNames;
-    std::vector<int> namedRegs;
-    std::vector<Type> namedTypes;
+  // For multi-decl: id, id, id...
+  std::vector<std::string> names;
 };
 
-// Small helpers
-static inline std::string itos(int v) {
-    return std::to_string(v);
-}
+struct VarBinding {
+  Type type = Type::VOID;
+  int offset = 0;      // bytes from FP (I1). locals >= 0, params < 0
+  int scopeDepth = 0;
+};
 
-static inline std::vector<int> mergeLists(const std::vector<int>& a, const std::vector<int>& b) {
-    std::vector<int> out;
-    out.reserve(a.size() + b.size());
-    out.insert(out.end(), a.begin(), a.end());
-    out.insert(out.end(), b.begin(), b.end());
-    return out;
-}
+struct FunctionInfo {
+  Type retType = Type::VOID;
+  std::vector<Type> paramTypes;
+  std::vector<std::string> paramNames;
 
-// A very small "code buffer" that stores the generated Riski assembly.
-//
-// Line numbers are 1-based (the first emitted instruction is line 1).
-// Backpatching works by emitting jump instructions with a trailing space,
-// e.g. "UJUMP " or "BREQZ I10 ", and then later appending the absolute
-// jump target line number.
+  bool isDefined = false;
+  int startLineImplementation = 0;
+
+  // All call sites (lines of JLINK instructions)
+  std::vector<int> callLines;
+
+  // Only those call sites not yet patched to a local implementation
+  std::vector<int> unresolvedCallLines;
+};
+
+// -----------------------------
+// Code buffer (1-based "line numbers")
+// -----------------------------
 class CodeBuffer {
 public:
-    int nextQuad() const;
-    void emit(const std::string& line);
-
-    // Appends the numeric label to each listed line.
-    void backpatch(const std::vector<int>& lst, int label);
-
-    const std::vector<std::string>& getLines() const;
-
-    // Replace an existing line (1-based line number). No-op on out-of-range.
-    void patchLine(int lineNo, const std::string& newLine);
-
-    // Return the entire program text (instructions separated by \n).
-    std::string str() const;
+  int nextQuad() const;  // 1-based next line index
+  void emit(const std::string& line);
+  void backpatch(const std::vector<int>& list, int label);
+  std::string str() const;
 
 private:
-    std::vector<std::string> m_lines;
+  std::vector<std::string> m_lines;
 };
 
+// -----------------------------
+// Globals used by lex/yacc
+// -----------------------------
+extern CodeBuffer g_code;
+extern std::string g_curr_lexeme;
 
-#endif
+extern std::unordered_map<std::string, FunctionInfo> g_functions;
+
+// yy line number (flex %option yylineno)
+extern int yylineno;
+
+// Final output (driver writes it to .rsk)
+extern std::string g_final_output;
+
+// -----------------------------
+// Exit codes
+// -----------------------------
+constexpr int LEXICAL_ERROR = 1;
+constexpr int SYNTAX_ERROR = 2;
+constexpr int SEMANTIC_ERROR = 3;
+constexpr int OPERATIONAL_ERROR = 4;
+
+// -----------------------------
+// Error helpers
+// -----------------------------
+void reportLexicalErrorAndExit(const std::string& lexeme, int line);
+void reportSyntaxErrorAndExit(const std::string& lexeme, int line);
+void reportSemanticErrorAndExit(const std::string& msg, int line);
+void reportOperationalErrorAndExit(const std::string& msg);
+
+std::string typeToString(Type t);

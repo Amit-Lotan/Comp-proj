@@ -1,72 +1,114 @@
 %{
-    #include <stdio.h>
-    #include <stdlib.h>
-    #include <string>
-    #include <iostream>
-    #include "part3_helpers.hpp"
-    #include "part3.tab.hpp"
-    using namespace std;
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+
+#include "part3_helpers.hpp"
+#include "part3.tab.hpp"
 %}
 
-%option yylineno
-%option noyywrap
+%option noyywrap yylineno nodefault
+%option noinput nounput
 
-digit           ([0-9])
-letter          ([a-zA-Z])
-whitespace      ([\t\r\n ])
-id              {letter}({letter}|{digit}|_)*
-integer         {digit}+
-real            {digit}+\.{digit}+
-str             \"(\\.|[^"\n])*\"
-relop           "=="|"<>"|"<"|"<="|">"|">="
-addop           "+"|"-" 
-mulop           "*"|"/"
-assign          "="
-and             "&&"
-or              "||"
-not             "!"
-comment         "#"([^\r\n]|[^\n])*
+ID            [A-Za-z][A-Za-z0-9_]*
+INTEGERNUM    [0-9]+
+REALNUM       [0-9]+\.[0-9]+
+RELOP         (==|<>|<=|>=|<|>)
+ADDOP         (\+|-)
+MULOP         (\*|\/)
+STR           \"([^\"\\\n\r]|\\[tn\"\\])*\"
+BADSTR        \"([^\"\\\n\r]|\\.)*\"
+
+WS            [ \t\r]+
+COMMENT       \#.*
 
 %%
 
-int             { return TINT; }
-float           { return TFLOAT; }
-void            { return TVOID; }
-write           { return TWRITE; }
-read            { return TREAD; }
-while           { return TWHILE; }
-do              { return TDO; }
-if              { return TIF; }
-then            { return TTHEN; }
-else            { return TELSE; }
-return          { return TRET; }
+{WS}                { /* skip */ }
+{COMMENT}           { /* skip */ }
+\n                  { /* yylineno is updated automatically */ }
 
-{relop}         { yylval.node = new Node(); yylval.node->str = yytext; return TRELOP; }
-{addop}         { yylval.node = new Node(); yylval.node->str = yytext; return TADDOP; }
-{mulop}         { yylval.node = new Node(); yylval.node->str = yytext; return TMULOP; }
-{assign}        { return TASSIGN; }
-{and}           { return TAND; }
-{or}            { return TOR; }
-{not}           { return TNOT; }
+"int"               { return TK_INT; }
+"float"             { return TK_FLOAT; }
+"void"              { return TK_VOID; }
+"if"                { return TK_IF; }
+"then"              { return TK_THEN; }
+"else"              { return TK_ELSE; }
+"while"             { return TK_WHILE; }
+"do"                { return TK_DO; }
+"read"              { return TK_READ; }
+"write"             { return TK_WRITE; }
+"return"            { return TK_RETURN; }
 
-{integer}       { yylval.node = new Node(); yylval.node->str = yytext; return TNUM; }
-{real}          { yylval.node = new Node(); yylval.node->str = yytext; return TREAL; }
-{id}            { yylval.node = new Node(); yylval.node->str = yytext; return TID; }
-{str}           { 
-                    string s = yytext;
-                    yylval.node = new Node(); 
-                    yylval.node->str = s.substr(1, s.length()-2); 
-                    return TSTR;
-                }
+"&&"                { return TK_AND; }
+"||"                { return TK_OR; }
+"!"                 { return TK_NOT; }
+"="                 { return TK_ASSIGN; }
 
-[(){},:;]       { return yytext[0]; }
+"("                 { return '('; }
+")"                 { return ')'; }
+"{"                 { return '{'; }
+"}"                 { return '}'; }
+","                 { return ','; }
+";"                 { return ';'; }
+":"                 { return ':'; }
 
-{comment}       ;
-{whitespace}    ;
+{RELOP}             {
+                        yylval.a = new Attr();
+                        yylval.a->str = yytext;
+                        return TK_RELOP;
+                    }
 
-.               {
-                    cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << endl;
-                    exit(LEXICAL_ERROR);
-                }
+{ADDOP}             {
+                        yylval.a = new Attr();
+                        yylval.a->str = yytext;
+                        return TK_ADDOP;
+                    }
+
+{MULOP}             {
+                        yylval.a = new Attr();
+                        yylval.a->str = yytext;
+                        return TK_MULOP;
+                    }
+
+{STR}               {
+                        std::string s(yytext);
+                        yylval.a = new Attr();
+                        if (s.size() >= 2) {
+                            yylval.a->str = s.substr(1, s.size() - 2);
+                        } else {
+                            yylval.a->str.clear();
+                        }
+                        return TK_STR;
+                    }
+
+/* Properly terminated string, but contains an illegal escape like \q */
+{BADSTR}            {
+                        std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
+                        std::exit(LEXICAL_ERROR);
+                    }
+
+{REALNUM}            {
+                        yylval.a = new Attr();
+                        yylval.a->str = yytext;
+                        return TK_REALNUM;
+                    }
+
+{INTEGERNUM}         {
+                        yylval.a = new Attr();
+                        yylval.a->str = yytext;
+                        return TK_INTEGERNUM;
+                    }
+
+{ID}                 {
+                        yylval.a = new Attr();
+                        yylval.a->str = yytext;
+                        return TK_ID;
+                    }
+
+.                    {
+                        std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
+                        std::exit(LEXICAL_ERROR);
+                    }
 
 %%

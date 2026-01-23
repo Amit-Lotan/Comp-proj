@@ -29,9 +29,8 @@
     Type currentReturnType = void_t;
     int currentBlockDepth = 0;
     
-    // Track the type of each register to ensure we only save/restore correct types
+    // Type tracking to prevent "Illegal regtype" errors in VM
     vector<Type> regTypes(200, void_t); 
-    
     vector<vector<string> > scopeVarNames;
 
     void printSemanticError(string err) {
@@ -50,10 +49,9 @@
         return "void";
     }
 
-    // Updated allocator to track type
     int nextReg(Type t) {
-        if (currentScopeRegsNum >= regTypes.size()) {
-            regTypes.resize(currentScopeRegsNum * 2);
+        if (currentScopeRegsNum >= (int)regTypes.size()) {
+            regTypes.resize(currentScopeRegsNum * 2, void_t);
         }
         regTypes[currentScopeRegsNum] = t;
         return currentScopeRegsNum++;
@@ -108,7 +106,7 @@ FDEFS : FDEFS FUNC_DEF_START BLK M {
         symbolTable.clear();
         scopeVarNames.clear();
         currentScopeRegsNum = 3; 
-        regTypes.assign(200, void_t); // Reset type tracking
+        regTypes.assign(200, void_t);
     }
     | FDEFS FUNC_HEADER ';' {
         symbolTable.clear();
@@ -144,7 +142,7 @@ FUNC_HEADER : TYPE TID '(' M FUNC_ARGS ')' {
         }
         
         currentReturnType = $1->type;
-        currentScopeOffset = 0; // FP
+        currentScopeOffset = 0; 
         
         $$ = new Node();
         $$->str = name;
@@ -161,17 +159,20 @@ FUNC_DEF_START : FUNC_HEADER {
         f.defined = true;
         f.startLineImplementation = buffer->nextquad();
         
-        // Prologue
-        buffer->emit("STORI I1 I2 0"); // Save Old FP
-        buffer->emit("STORI I0 I2 4"); // Save RetAddr
-        buffer->emit("ADD2I I2 I2 8"); // SP += 8
-        buffer->emit("COPYI I1 I2");   // FP = SP
+        // Prologue: Save Old FP, RetAddr, update FP
+        buffer->emit("STORI I1 I2 0"); 
+        buffer->emit("STORI I0 I2 4"); 
+        buffer->emit("ADD2I I2 I2 8"); 
+        buffer->emit("COPYI I1 I2");   
         
         $$ = $1;
     }
     ;
 
 FUNC_ARGS : FUNC_ARGLIST {
+        // Stack: [Arg N] ... [Arg 1] [OldFP] [RetAddr]
+        // FP Points to top of RetAddr.
+        // Arg 1 is at -12 - (N-1)*4
         int nParams = $1->paramNames.size();
         scopeVarNames.push_back(vector<string>()); 
         
@@ -190,7 +191,6 @@ FUNC_ARGS : FUNC_ARGLIST {
             
             symbolTable[pname].push_back(s);
         }
-        
         $$ = $1; 
     }
     | /* EPSILON */ { 
@@ -286,9 +286,7 @@ STMT : DCL ';' {
         $$ = new Node();
     }
     | ASSN { $$ = new Node(); }
-    | EXP ';' {
-        $$ = new Node();
-    }
+    | EXP ';' { $$ = new Node(); }
     | CNTRL { $$ = $1; }
     | READ { $$ = new Node(); }
     | WRITE { $$ = new Node(); }
@@ -360,10 +358,9 @@ BEXP : BEXP TOR M BEXP {
         if ($1->type != $3->type) printSemanticError("type mismatch in comparison");
         if ($1->type == void_t) printSemanticError("void in comparison");
         
-        int r = nextReg(int_t); // Result is INT (boolean)
+        int r = nextReg(int_t);
         string op = $2->str;
         string branch;
-        
         bool isFloat = ($1->type == float_type);
         string suffix = isFloat ? "F" : "I";
         string opCode;
@@ -378,9 +375,7 @@ BEXP : BEXP TOR M BEXP {
         string prefix = isFloat ? "F" : "I";
         string reg1 = prefix + intToString($1->regNum);
         string reg2 = prefix + intToString($3->regNum);
-        
         string destReg = (isFloat ? "F" : "I") + intToString(r);
-        
         int resReg = r;
         
         if (op == "<=") {
@@ -406,9 +401,7 @@ BEXP : BEXP TOR M BEXP {
         $$->falseList.push_back(buffer->nextquad());
         buffer->emit("UJUMP ");
     }
-    | '(' BEXP ')' {
-        $$ = $2;
-    }
+    | '(' BEXP ')' { $$ = $2; }
     ;
 
 EXP : EXP TADDOP EXP {
@@ -420,12 +413,9 @@ EXP : EXP TADDOP EXP {
         $$->regNum = nextReg($$->type);
         
         string op = $2->str;
-        string inst;
+        string inst = (op == "+") ? "ADD2" : "SUBT";
         string prefix = ($$->type == int_t) ? "I" : "F";
         string suffix = ($$->type == int_t) ? "I" : "F";
-        
-        if (op == "+") inst = "ADD2";
-        else inst = "SUBT";
         
         buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
     }
@@ -438,12 +428,9 @@ EXP : EXP TADDOP EXP {
         $$->regNum = nextReg($$->type);
         
         string op = $2->str;
-        string inst;
+        string inst = (op == "*") ? "MULT" : "DIVD";
         string prefix = ($$->type == int_t) ? "I" : "F";
         string suffix = ($$->type == int_t) ? "I" : "F";
-        
-        if (op == "*") inst = "MULT";
-        else inst = "DIVD";
         
         buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
     }
@@ -473,7 +460,6 @@ EXP : EXP TADDOP EXP {
         
         string regPrefix = ($$->type == int_t) ? "I" : "F";
         string loadCmd = ($$->type == int_t) ? "LOADI" : "LOADF";
-        
         buffer->emit(loadCmd + " " + regPrefix + intToString($$->regNum) + " I1 " + intToString(s.offset));
     }
     | TNUM {
@@ -488,9 +474,7 @@ EXP : EXP TADDOP EXP {
         $$->regNum = nextReg(float_type);
         buffer->emit("COPYF F" + intToString($$->regNum) + " " + $1->str);
     }
-    | CALL {
-        $$ = $1;
-    }
+    | CALL { $$ = $1; }
     | '(' EXP ')' { $$ = $2; }
     ;
 
@@ -537,7 +521,7 @@ CALL : TID '(' CALL_ARGS ')' {
             if(!set[i]) printSemanticError("missing argument for '" + f.paramNames[i] + "'");
         }
 
-        // SMART SAVE: Only save registers that match their allocated type
+        // SAVE REGISTERS (Only the used ones, with correct types)
         int savedCount = 0;
         for(int i=3; i<currentScopeRegsNum; ++i) {
             if (regTypes[i] == int_t) {
@@ -549,6 +533,7 @@ CALL : TID '(' CALL_ARGS ')' {
         }
         buffer->emit("ADD2I I2 I2 " + intToString(savedCount * 4));
         
+        // PUSH ARGUMENTS
         for(size_t i=0; i<orderedRegs.size(); ++i) {
             Type t = f.paramTypes[i];
             string p = (t==int_t) ? "I" : "F";
@@ -556,6 +541,7 @@ CALL : TID '(' CALL_ARGS ')' {
             buffer->emit("ADD2I I2 I2 4");
         }
         
+        // CALL
         int callQuad = buffer->nextquad();
         buffer->emit("JLINK ");
         if(!f.defined) {
@@ -564,9 +550,10 @@ CALL : TID '(' CALL_ARGS ')' {
             buffer->backpatch(vector<int>(1, callQuad), f.startLineImplementation);
         }
         
+        // CLEANUP ARGUMENTS
         buffer->emit("SUBTI I2 I2 " + intToString(orderedRegs.size() * 4));
         
-        // SMART RESTORE
+        // RESTORE REGISTERS
         buffer->emit("SUBTI I2 I2 " + intToString(savedCount * 4));
         int restoreCount = 0;
         for(int i=3; i<currentScopeRegsNum; ++i) {
@@ -580,8 +567,9 @@ CALL : TID '(' CALL_ARGS ')' {
         
         $$ = new Node();
         $$->type = f.returnType;
-        $$->regNum = nextReg($$->type); // Allocate result reg with correct type
+        $$->regNum = nextReg($$->type);
         
+        // Get return value from I11/F11
         if(f.returnType != void_t) {
             string p = (f.returnType == int_t) ? "I" : "F";
             buffer->emit("COPY" + p + " " + p + intToString($$->regNum) + " " + p + "11");
@@ -590,14 +578,10 @@ CALL : TID '(' CALL_ARGS ')' {
     ;
 
 CALL_ARGS : CALL_ARGS_LIST { $$ = $1; }
-          | /* EPSILON */ { 
-              $$ = new Node();
-          }
+          | /* EPSILON */ { $$ = new Node(); }
           ;
 
-CALL_ARGS_LIST : CALL_ARG_ITEM {
-               $$ = $1;
-           }
+CALL_ARGS_LIST : CALL_ARG_ITEM { $$ = $1; }
            | CALL_ARGS_LIST ',' CALL_ARG_ITEM {
                $$ = $1;
                $$->namedLabels.push_back($3->namedLabels[0]);
@@ -659,6 +643,7 @@ RETURN : TRET EXP ';' {
     if(currentReturnType == void_t) printSemanticError("void function cannot return value");
     if(currentReturnType != $2->type) printSemanticError("return type mismatch");
     
+    // Put return value in I11/F11
     string p = ($2->type == int_t) ? "I" : "F";
     buffer->emit("COPY" + p + " " + p + "11 " + p + intToString($2->regNum));
     
@@ -704,7 +689,6 @@ int main(int argc, char* argv[]) {
     if(!yyin) printOperationalError("cannot open input file");
     
     yyparse();
-    
     fclose(yyin);
     
     string outName = fname.substr(0, fname.find_last_of(".")) + ".rsk";
@@ -729,7 +713,6 @@ int main(int argc, char* argv[]) {
     out << unimpl << endl;
     out << impl << endl;
     out << "</header>" << endl;
-    
     out << buffer->printBuffer();
     out.close();
     

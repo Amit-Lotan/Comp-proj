@@ -22,18 +22,15 @@
     CodeBuffer* buffer = &mainBuffer;
     
     map<string, Function> functionTable;
-    // Maps variable name to a stack of Symbols (for scope handling)
     map<string, vector<Symbol> > symbolTable;
     
-    int currentScopeOffset = 0; // Bytes relative to I1 (FP)
-    int currentScopeRegsNum = 3; // Start from 3 (I0,I1,I2 reserved)
+    int currentScopeOffset = 0; 
+    int currentScopeRegsNum = 3; 
     Type currentReturnType = void_t;
     int currentBlockDepth = 0;
     
-    // For checking duplicate vars in current scope
     vector<vector<string> > scopeVarNames;
 
-    // Helper functions
     void printSemanticError(string err) {
         cerr << "Semantic error: " << err << " in line number " << yylineno << endl;
         exit(SEMANTIC_ERROR);
@@ -50,7 +47,6 @@
         return "void";
     }
 
-    // Allocate next available register
     int nextReg() {
         return currentScopeRegsNum++;
     }
@@ -66,13 +62,12 @@
 %token <node> TIF TTHEN TELSE
 %token <node> TOR TAND TNOT
 
-%type <node> PROGRAM FDEFS FUNC_API BLK BLK_OPEN BLK_CLOSE M N
+%type <node> PROGRAM FDEFS FUNC_HEADER FUNC_DEF_START BLK BLK_OPEN BLK_CLOSE M N
 %type <node> FUNC_ARGS FUNC_ARGLIST DCL TYPE
 %type <node> STLIST STMT ASSN EXP CALL CALL_ARGS CALL_ARGS_LIST
 %type <node> CNTRL BEXP WRITE READ LVAL RETURN
 %type <node> CALL_ARG_ITEM
 
-// Precedence
 %right TASSIGN
 %left TOR
 %left TAND
@@ -88,7 +83,6 @@
 %%
 
 PROGRAM : FDEFS {
-        // Backpatch unresolved calls for functions defined later
         for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); ++it) {
             if(it->second.defined) {
                 buffer->backpatch(it->second.callingLines, it->second.startLineImplementation);
@@ -97,18 +91,18 @@ PROGRAM : FDEFS {
     }
     ;
 
-FDEFS : FDEFS FUNC_API BLK M {
+FDEFS : FDEFS FUNC_DEF_START BLK M {
         buffer->backpatch($3->nextList, $4->quad);
         buffer->emit("COPYI I2 I1");
         buffer->emit("LOADI I1 I1 0");
         buffer->emit("RETRN");
         
-        // Clear local scope
         symbolTable.clear();
         scopeVarNames.clear();
         currentScopeRegsNum = 3; 
     }
-    | FDEFS FUNC_API ';' {
+    | FDEFS FUNC_HEADER ';' {
+        // Declaration only - clear the params added by HEADER
         symbolTable.clear();
         scopeVarNames.clear();
         currentScopeRegsNum = 3; 
@@ -116,7 +110,7 @@ FDEFS : FDEFS FUNC_API BLK M {
     | /* EPSILON */ { }
     ;
 
-FUNC_API : TYPE TID '(' M FUNC_ARGS ')' {
+FUNC_HEADER : TYPE TID '(' M FUNC_ARGS ')' {
         string name = $2->str;
         
         if (name == "main" && $1->type != void_t) {
@@ -125,36 +119,50 @@ FUNC_API : TYPE TID '(' M FUNC_ARGS ')' {
         
         if (functionTable.find(name) != functionTable.end()) {
              Function& f = functionTable[name];
-             if (f.defined) printSemanticError("redefinition of function '" + name + "'");
-             
+             // Check signature for both Def and Decl
              if ($1->type != f.returnType) printSemanticError("conflicting return type for '" + name + "'");
              if ($5->paramTypes.size() != f.paramTypes.size()) printSemanticError("conflicting number of arguments for '" + name + "'");
              for(size_t i=0; i<f.paramTypes.size(); ++i) {
                  if(f.paramTypes[i] != $5->paramTypes[i]) printSemanticError("conflicting types for '" + name + "'");
              }
-             
-             f.defined = true;
-             f.startLineImplementation = $4->quad;
+             // Do NOT check defined here. Do NOT emit prologue here.
         } else {
              Function f;
              f.returnType = $1->type;
              f.paramTypes = $5->paramTypes;
              f.paramNames = $5->paramNames;
-             f.defined = true; 
-             f.startLineImplementation = $4->quad;
+             f.defined = false; 
+             f.startLineImplementation = 0;
              functionTable[name] = f;
         }
         
         currentReturnType = $1->type;
         currentScopeOffset = 0; // FP
         
+        $$ = new Node();
+        $$->str = name;
+        // Pass param info if needed, but it's in symbol table now.
+    }
+    ;
+
+FUNC_DEF_START : FUNC_HEADER {
+        string name = $1->str;
+        Function& f = functionTable[name];
+        
+        if (f.defined) {
+             printSemanticError("redefinition of function '" + name + "'");
+        }
+        f.defined = true;
+        // Start line is next quad
+        f.startLineImplementation = buffer->nextquad();
+        
+        // Emit Prologue
         buffer->emit("STORI I1 I2 0"); // Save Old FP
         buffer->emit("STORI I0 I2 4"); // Save RetAddr (I0)
         buffer->emit("ADD2I I2 I2 8"); // Bump SP
         buffer->emit("COPYI I1 I2");   // FP = SP (points after header)
         
-        $$ = new Node();
-        $$->str = name;
+        $$ = $1;
     }
     ;
 
@@ -179,7 +187,7 @@ FUNC_ARGS : FUNC_ARGLIST {
             symbolTable[pname].push_back(s);
         }
         
-        $$ = $1; // Pass pointer
+        $$ = $1; 
     }
     | /* EPSILON */ { 
         scopeVarNames.push_back(vector<string>());
@@ -207,7 +215,6 @@ DCL : TID ':' TYPE {
     }
     | TID ',' DCL {
         $$ = $3;
-        // Insert at beginning to maintain order a,b,c
         $$->paramNames.insert($$->paramNames.begin(), $1->str);
         $$->paramTypes.insert($$->paramTypes.begin(), $3->paramTypes[0]); 
     }
@@ -232,7 +239,6 @@ BLK_OPEN : /* EPSILON */ {
     ;
 
 BLK_CLOSE : /* EPSILON */ {
-        // Pop variables of this scope
         vector<string>& currentVars = scopeVarNames.back();
         for(size_t i=0; i<currentVars.size(); ++i) {
             symbolTable[currentVars[i]].pop_back();
@@ -277,9 +283,6 @@ STMT : DCL ';' {
     }
     | ASSN { $$ = new Node(); }
     | EXP ';' {
-        if ($1->type != void_t) {
-            // Relaxed
-        }
         $$ = new Node();
     }
     | CNTRL { $$ = $1; }
@@ -499,7 +502,7 @@ CALL : TID '(' CALL_ARGS ')' {
         vector<int> orderedRegs(f.paramTypes.size(), -1);
         vector<bool> set(f.paramTypes.size(), false);
         
-        size_t positionalCount = 0; // Changed to size_t
+        size_t positionalCount = 0; 
         for(size_t i=0; i<actualTypes.size(); ++i) {
             if(namedLabels[i] == "") {
                 if(positionalCount >= f.paramTypes.size()) printSemanticError("too many arguments");

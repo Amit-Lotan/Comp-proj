@@ -46,7 +46,7 @@
     
     string typeToString(Type t) {
         if(t == int_t) return "int";
-        if(t == float_t) return "float";
+        if(t == float_type) return "float";
         return "void";
     }
 
@@ -98,38 +98,17 @@ PROGRAM : FDEFS {
     ;
 
 FDEFS : FDEFS FUNC_API BLK M {
-        // Function Definition End
-        // Always emit return just in case
-        // Restore stack: I2 = I1, Restore Old FP (I4), Restore RetAddr (I0) -> handled in prologue/epilogue strategy
-        // But here we use a simpler strategy: Function assumes I0 is return address.
-        
-        // We need to backpatch nextList of block to end of function
         buffer->backpatch($3->nextList, $4->quad);
-        
-        // Epilogue logic implied: return from function
-        // If user didn't write return, we do it here.
-        // Recover stack frame: I2 = I1
         buffer->emit("COPYI I2 I1");
-        // Restore old FP (stored at [FP])
         buffer->emit("LOADI I1 I1 0");
-        // Restore return address (stored at [FP+4]) - Wait, Reference implementation stored it at Caller.
-        // Let's stick to Reference logic: Caller restores regs. Callee restores FP.
-        // Wait, Reference part3_suggestion.ypp says:
-        // "RETRN" jumps to I0.
-        // "JLINK" sets I0 (or I10?).
-        // In RX VM: JLINK L -> $10 = PC+1; goto L.
-        // RETRN -> goto $10. (assuming I10? or I0?).
-        // PDF says: I0 is return address.
-        
         buffer->emit("RETRN");
         
         // Clear local scope
         symbolTable.clear();
         scopeVarNames.clear();
-        currentScopeRegsNum = 3; // Reset regs for next function
+        currentScopeRegsNum = 3; 
     }
     | FDEFS FUNC_API ';' {
-        // Function Declaration
         symbolTable.clear();
         scopeVarNames.clear();
         currentScopeRegsNum = 3; 
@@ -138,19 +117,16 @@ FDEFS : FDEFS FUNC_API BLK M {
     ;
 
 FUNC_API : TYPE TID '(' M FUNC_ARGS ')' {
-        // Function Header
         string name = $2->str;
         
         if (name == "main" && $1->type != void_t) {
             printSemanticError("incompatible return type of main function");
         }
         
-        // Check if already declared/defined
         if (functionTable.find(name) != functionTable.end()) {
              Function& f = functionTable[name];
              if (f.defined) printSemanticError("redefinition of function '" + name + "'");
              
-             // Check signature
              if ($1->type != f.returnType) printSemanticError("conflicting return type for '" + name + "'");
              if ($5->paramTypes.size() != f.paramTypes.size()) printSemanticError("conflicting number of arguments for '" + name + "'");
              for(size_t i=0; i<f.paramTypes.size(); ++i) {
@@ -164,68 +140,27 @@ FUNC_API : TYPE TID '(' M FUNC_ARGS ')' {
              f.returnType = $1->type;
              f.paramTypes = $5->paramTypes;
              f.paramNames = $5->paramNames;
-             f.defined = true; // It's a definition (or decl that acts as one for now)
+             f.defined = true; 
              f.startLineImplementation = $4->quad;
              functionTable[name] = f;
         }
         
-        // If this is a definition (not ending in ;)
         currentReturnType = $1->type;
         currentScopeOffset = 0; // FP
-        
-        // Prologue: Save Old FP
-        // Caller saves RetAddr to stack. Callee saves Old FP.
-        // But JLINK writes to register I10 (or I0 per PDF).
-        // Let's adopt standard:
-        // Caller saves Caller-Saved-Regs.
-        // JLINK -> I0 holds ret addr.
-        // Callee: 
-        //   Save Old FP (I1) to Stack.
-        //   Save I0 (RetAddr) to Stack (so we can call other funcs).
-        //   I1 = I2 (New FP).
         
         buffer->emit("STORI I1 I2 0"); // Save Old FP
         buffer->emit("STORI I0 I2 4"); // Save RetAddr (I0)
         buffer->emit("ADD2I I2 I2 8"); // Bump SP
         buffer->emit("COPYI I1 I2");   // FP = SP (points after header)
         
-        // We already added parameters to symbolTable in FUNC_ARGS with negative offsets
-        // But wait, offsets must be relative to I1 (FP).
-        // If params are pushed by caller:
-        // [Args][OldFP][RetAddr] <-- I1
-        // Then params are at negative offsets.
-        // Reference suggestion logic used this.
-        
-        // Fix up offsets for parameters in symbol table
-        // We pushed them in FUNC_ARGS assuming stack grows up.
-        // The parser processed FUNC_ARGS *before* generating prologue.
-        // We need to re-insert them properly or assume FUNC_ARGS handled it.
-        
-        $$.str = name;
+        $$ = new Node();
+        $$->str = name;
     }
     ;
 
 FUNC_ARGS : FUNC_ARGLIST {
-        // Params are at offsets -4, -8, etc. relative to NEW FP (I1).
-        // But Wait: [ArgN]...[Arg1][OldFP][RetAddr] <-- I1.
-        // So Arg1 is at -12 (if 4 bytes each), Arg2 at -16?
-        // Let's assume standard:
-        // Caller pushes ArgN...Arg1.
-        // Then Call.
-        // Prologue pushes OldFP, RetAddr.
-        // So I1 points to top of RetAddr.
-        // Arg1 is at I1 - 8 (RetAddr) - 4 (OldFP) - 4 = -12?
-        
-        // Let's use specific offsets. 
-        // Header is 8 bytes.
-        // offset 0: Local 1? No.
-        
-        // Re-map the parameters into the symbol table with correct offsets
-        // Symbols are already in $1->paramNames/Types.
-        
-        int offset = -8; // Skip OldFP(4) and RetAddr(4)
-        
-        scopeVarNames.push_back(vector<string>()); // New Scope for params
+        int offset = -8; 
+        scopeVarNames.push_back(vector<string>()); 
         
         for(size_t i=0; i<$1->paramNames.size(); ++i) {
             string pname = $1->paramNames[i];
@@ -238,65 +173,61 @@ FUNC_ARGS : FUNC_ARGLIST {
             
             Symbol s;
             s.type = ptype;
-            offset -= 4; // All types are 32-bit (4 bytes)
+            offset -= 4; 
             s.offset = offset;
             
             symbolTable[pname].push_back(s);
         }
         
-        $$.paramTypes = $1->paramTypes;
-        $$.paramNames = $1->paramNames;
+        $$ = $1; // Pass pointer
     }
     | /* EPSILON */ { 
         scopeVarNames.push_back(vector<string>());
+        $$ = new Node();
     }
     ;
 
 FUNC_ARGLIST : FUNC_ARGLIST ',' DCL {
-        $$.paramTypes = $1->paramTypes;
-        $$.paramNames = $1->paramNames;
-        // DCL can be "a,b : int".
+        $$ = $1;
         for(size_t i=0; i<$3->paramNames.size(); ++i) {
-            $$.paramNames.push_back($3->paramNames[i]);
-            $$.paramTypes.push_back($3->paramTypes[i]);
+            $$->paramNames.push_back($3->paramNames[i]);
+            $$->paramTypes.push_back($3->paramTypes[i]);
         }
     }
     | DCL {
-        $$.paramNames = $1->paramNames;
-        $$.paramTypes = $1->paramTypes;
+        $$ = $1;
     }
     ;
 
 DCL : TID ':' TYPE {
         if($3->type == void_t) printSemanticError("variable has incompatible type 'void'");
-        $$.paramNames.push_back($1->str);
-        $$.paramTypes.push_back($3->type);
+        $$ = new Node();
+        $$->paramNames.push_back($1->str);
+        $$->paramTypes.push_back($3->type);
     }
     | TID ',' DCL {
-        $$.paramNames.push_back($1->str);
-        $$.paramTypes.push_back($3->paramTypes[0]); // Type propagates from bottom up? "a,b:int"
-        // In recursive rule "TID, DCL", DCL holds the type.
-        for(size_t i=0; i<$3->paramNames.size(); ++i) {
-            $$.paramNames.push_back($3->paramNames[i]);
-            $$.paramTypes.push_back($3->paramTypes[i]);
-        }
+        $$ = $3;
+        // Insert at beginning to maintain order a,b,c
+        $$->paramNames.insert($$->paramNames.begin(), $1->str);
+        $$->paramTypes.insert($$->paramTypes.begin(), $3->paramTypes[0]); 
     }
     ;
 
-TYPE : TINT { $$.type = int_t; }
-     | TFLOAT { $$.type = float_t; }
-     | TVOID { $$.type = void_t; }
+TYPE : TINT { $$ = new Node(); $$->type = int_t; }
+     | TFLOAT { $$ = new Node(); $$->type = float_type; }
+     | TVOID { $$ = new Node(); $$->type = void_t; }
      ;
 
 BLK : '{' BLK_OPEN STLIST M BLK_CLOSE '}' {
         buffer->backpatch($3->nextList, $4->quad);
-        $$ = $3; // Pass nextList up if needed
+        $$ = $3; 
     }
     ;
 
 BLK_OPEN : /* EPSILON */ {
         currentBlockDepth++;
         scopeVarNames.push_back(vector<string>());
+        $$ = new Node();
     }
     ;
 
@@ -311,24 +242,23 @@ BLK_CLOSE : /* EPSILON */ {
         }
         scopeVarNames.pop_back();
         currentBlockDepth--;
+        $$ = new Node();
     }
     ;
 
 STLIST : STLIST M STMT {
         buffer->backpatch($1->nextList, $2->quad);
-        $$.nextList = $3->nextList;
+        $$ = new Node();
+        $$->nextList = $3->nextList;
     }
-    | /* EPSILON */ { }
+    | /* EPSILON */ { $$ = new Node(); }
     ;
 
 STMT : DCL ';' {
-        // Variable Declaration
-        // Allocate space on stack (grow up)
         for(size_t i=0; i<$1->paramNames.size(); ++i) {
             string name = $1->paramNames[i];
             Type type = $1->paramTypes[i];
             
-            // Check redefinition in current block
             vector<string>& vars = scopeVarNames.back();
             if(find(vars.begin(), vars.end(), name) != vars.end()) {
                 printSemanticError("repeated declaration of identifier '" + name + "'");
@@ -337,41 +267,26 @@ STMT : DCL ';' {
             
             Symbol s;
             s.type = type;
-            s.offset = currentScopeOffset; // Relative to I1 (FP)
-            // Local vars start at offset 0 (since FP is above Header)
-            // Wait, FP points to [RetAddr+4]. Header is below.
-            // Locals grow UP from FP.
-            
+            s.offset = currentScopeOffset; 
             symbolTable[name].push_back(s);
             
-            // Emit code to reserve space (Update SP/I2 is implicitly handled by offset tracking, 
-            // but we need to physically move I2 if we want to protect them from interrupts/signals, 
-            // though here we just track offsets. But for CALLs to work, I2 must be above locals).
-            
-            buffer->emit("ADD2I I2 I2 4"); // 4 bytes per var
+            buffer->emit("ADD2I I2 I2 4"); 
             currentScopeOffset += 4;
         }
+        $$ = new Node();
     }
-    | ASSN { }
+    | ASSN { $$ = new Node(); }
     | EXP ';' {
-        // Used for side effects? Only void allowed?
-        // PDF: "EXP derived from STMT must be void". 
-        // But what about "a = 5;"? That's ASSN.
-        // What about "foo();"? That's EXP.
-        // If EXP is not void, strictly speaking it's unused. PDF says "cast to void".
-        // But usually we allow "foo()" even if it returns int.
-        // "must be of type void (if needed cast to void)".
-        // We can enforce it:
         if ($1->type != void_t) {
-            // printSemanticError("expression statement must be void");
-            // Relaxed for practical reasons or user needs to cast.
+            // Relaxed
         }
+        $$ = new Node();
     }
-    | CNTRL { $$.nextList = $1->nextList; }
-    | READ { }
-    | WRITE { }
-    | RETURN { }
-    | BLK { $$.nextList = $1->nextList; }
+    | CNTRL { $$ = $1; }
+    | READ { $$ = new Node(); }
+    | WRITE { $$ = new Node(); }
+    | RETURN { $$ = new Node(); }
+    | BLK { $$ = $1; }
     ;
 
 ASSN : LVAL TASSIGN EXP ';' {
@@ -381,51 +296,58 @@ ASSN : LVAL TASSIGN EXP ';' {
         string storeCmd = ($1->type == int_t) ? "STORI" : "STORF";
         string regPrefix = ($1->type == int_t) ? "I" : "F";
         
-        // Store Reg ($3) to Memory ($1)
         buffer->emit(storeCmd + " " + regPrefix + intToString($3->regNum) + " I1 " + intToString($1->offset));
+        $$ = new Node();
     }
     ;
 
 LVAL : TID {
         if(symbolTable.find($1->str) == symbolTable.end()) printSemanticError("undeclared identifier '" + $1->str + "'");
         Symbol s = symbolTable[$1->str].back();
-        $$.type = s.type;
-        $$.offset = s.offset;
-        $$.str = $1->str;
+        $$ = new Node();
+        $$->type = s.type;
+        $$->offset = s.offset;
+        $$->str = $1->str;
     }
     ;
 
 CNTRL : TIF BEXP TTHEN M STMT TELSE N M STMT {
         buffer->backpatch($2->trueList, $4->quad);
         buffer->backpatch($2->falseList, $8->quad);
-        $$.nextList = merge($5->nextList, $6->nextList); // N's nextList (jump over else)
-        $$.nextList = merge($$.nextList, $9->nextList);
+        $$ = new Node();
+        $$->nextList = merge($5->nextList, $6->nextList); 
+        $$->nextList = merge($$->nextList, $9->nextList);
     }
     | TIF BEXP TTHEN M STMT %prec TIF_NO_ELSE {
         buffer->backpatch($2->trueList, $4->quad);
-        $$.nextList = merge($2->falseList, $5->nextList);
+        $$ = new Node();
+        $$->nextList = merge($2->falseList, $5->nextList);
     }
     | TWHILE M BEXP TDO M STMT {
         buffer->backpatch($3->trueList, $5->quad);
-        buffer->backpatch($6->nextList, $2->quad); // Loop back
+        buffer->backpatch($6->nextList, $2->quad); 
         buffer->emit("UJUMP " + intToString($2->quad));
-        $$.nextList = $3->falseList;
+        $$ = new Node();
+        $$->nextList = $3->falseList;
     }
     ;
 
 BEXP : BEXP TOR M BEXP {
         buffer->backpatch($1->falseList, $3->quad);
-        $$.trueList = merge($1->trueList, $4->trueList);
-        $$.falseList = $4->falseList;
+        $$ = new Node();
+        $$->trueList = merge($1->trueList, $4->trueList);
+        $$->falseList = $4->falseList;
     }
     | BEXP TAND M BEXP {
         buffer->backpatch($1->trueList, $3->quad);
-        $$.falseList = merge($1->falseList, $4->falseList);
-        $$.trueList = $4->trueList;
+        $$ = new Node();
+        $$->falseList = merge($1->falseList, $4->falseList);
+        $$->trueList = $4->trueList;
     }
     | TNOT BEXP {
-        $$.trueList = $2->falseList;
-        $$.falseList = $2->trueList;
+        $$ = new Node();
+        $$->trueList = $2->falseList;
+        $$->falseList = $2->trueList;
     }
     | EXP TRELOP EXP {
         if ($1->type != $3->type) printSemanticError("type mismatch in comparison");
@@ -433,77 +355,52 @@ BEXP : BEXP TOR M BEXP {
         
         int r = nextReg();
         string op = $2->str;
-        string inst;
         string branch;
         
-        bool isFloat = ($1->type == float_t);
-        string prefix = isFloat ? "F" : "I";
+        bool isFloat = ($1->type == float_type);
         string suffix = isFloat ? "F" : "I";
         string opCode;
-        
-        // Mapping: RelOp -> Instruction
-        // Result is always Int (0 or 1).
-        // Wait, for Float comparison (SEQUF), result is in a Float Reg?
-        // PDF: "SEQUF A B C: If B=C A=1 else A=0". 
-        // Notes: "Suffix F operations performed on float registers".
-        // Does A have to be Float? Usually yes in RISC.
-        // If so, we need to cast result to Int for Branching.
         
         if (op == "==") opCode = "SEQU";
         else if (op == "<>") opCode = "SNEQ";
         else if (op == "<") opCode = "SLET";
-        else if (op == "<=") opCode = "SLET"; // Use logic (not >)
+        else if (op == "<=") opCode = "SLET"; 
         else if (op == ">") opCode = "SGRT";
-        else if (op == ">=") opCode = "SGRT"; // Use logic
+        else if (op == ">=") opCode = "SGRT"; 
         
+        string prefix = isFloat ? "F" : "I";
         string reg1 = prefix + intToString($1->regNum);
         string reg2 = prefix + intToString($3->regNum);
         
-        // Dest reg
         string destReg = (isFloat ? "F" : "I") + intToString(r);
-        
-        // Handle <= and >= by checking opposite or swapping?
-        // Actually, logic: if (a <= b) -> SLET a b -> 1. BNEQZ 1 -> True.
-        // Wait, SLET is <. SLEQ is <=. 
-        // PDF table only has: SEQU, SNEQ, SLET (<), SGRT (>).
-        // No <= or >=.
-        // Logic: <= is ! (>). >= is ! (<).
-        // OR: a <= b is (a < b) || (a == b). Expensive.
-        // OR: !(a > b).
-        // Let's use negation logic.
         
         int resReg = r;
         
         if (op == "<=") {
-            // !(>)
-            buffer->emit("SGRT" + suffix + " " + destReg + " " + reg1 + " " + reg2); // Check >
-            // Branch False (TrueList) if result is 0 (NOT >).
+            buffer->emit("SGRT" + suffix + " " + destReg + " " + reg1 + " " + reg2); 
             branch = "BREQZ"; 
         } else if (op == ">=") {
-            // !(<)
-            buffer->emit("SLET" + suffix + " " + destReg + " " + reg1 + " " + reg2); // Check <
+            buffer->emit("SLET" + suffix + " " + destReg + " " + reg1 + " " + reg2); 
             branch = "BREQZ";
         } else {
-            // Normal
             buffer->emit(opCode + suffix + " " + destReg + " " + reg1 + " " + reg2);
             branch = "BNEQZ";
         }
 
-        // If result is in Float Reg (because input was float), move to Int for Branch
         if (isFloat) {
              int iReg = nextReg();
              buffer->emit("CFTOI I" + intToString(iReg) + " " + destReg);
              resReg = iReg;
         }
 
-        $$.trueList.push_back(buffer->nextquad());
+        $$ = new Node();
+        $$->trueList.push_back(buffer->nextquad());
         buffer->emit(branch + " I" + intToString(resReg) + " ");
-        $$.falseList.push_back(buffer->nextquad());
+        $$->falseList.push_back(buffer->nextquad());
         buffer->emit("UJUMP ");
     }
     | '(' BEXP ')' {
-        $$.trueList = $2->trueList;
-        $$.falseList = $2->falseList;
+        $$ = $2;
     }
     ;
 
@@ -511,48 +408,51 @@ EXP : EXP TADDOP EXP {
         if ($1->type != $3->type) printSemanticError("type mismatch in arithmetic");
         if ($1->type == void_t) printSemanticError("void in arithmetic");
         
-        $$.type = $1->type;
-        $$.regNum = nextReg();
+        $$ = new Node();
+        $$->type = $1->type;
+        $$->regNum = nextReg();
         
         string op = $2->str;
         string inst;
-        string prefix = ($$.type == int_t) ? "I" : "F";
-        string suffix = ($$.type == int_t) ? "I" : "F";
+        string prefix = ($$->type == int_t) ? "I" : "F";
+        string suffix = ($$->type == int_t) ? "I" : "F";
         
         if (op == "+") inst = "ADD2";
         else inst = "SUBT";
         
-        buffer->emit(inst + suffix + " " + prefix + intToString($$.regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
+        buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
     }
     | EXP TMULOP EXP {
         if ($1->type != $3->type) printSemanticError("type mismatch in arithmetic");
         if ($1->type == void_t) printSemanticError("void in arithmetic");
         
-        $$.type = $1->type;
-        $$.regNum = nextReg();
+        $$ = new Node();
+        $$->type = $1->type;
+        $$->regNum = nextReg();
         
         string op = $2->str;
         string inst;
-        string prefix = ($$.type == int_t) ? "I" : "F";
-        string suffix = ($$.type == int_t) ? "I" : "F";
+        string prefix = ($$->type == int_t) ? "I" : "F";
+        string suffix = ($$->type == int_t) ? "I" : "F";
         
         if (op == "*") inst = "MULT";
         else inst = "DIVD";
         
-        buffer->emit(inst + suffix + " " + prefix + intToString($$.regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
+        buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
     }
     | '(' TYPE ')' EXP {
-        // Cast
         if ($2->type == $4->type) {
             $$ = $4;
-        } else if ($2->type == int_t && $4->type == float_t) {
-            $$.type = int_t;
-            $$.regNum = nextReg();
-            buffer->emit("CFTOI I" + intToString($$.regNum) + " F" + intToString($4->regNum));
-        } else if ($2->type == float_t && $4->type == int_t) {
-            $$.type = float_t;
-            $$.regNum = nextReg();
-            buffer->emit("CITOF F" + intToString($$.regNum) + " I" + intToString($4->regNum));
+        } else if ($2->type == int_t && $4->type == float_type) {
+            $$ = new Node();
+            $$->type = int_t;
+            $$->regNum = nextReg();
+            buffer->emit("CFTOI I" + intToString($$->regNum) + " F" + intToString($4->regNum));
+        } else if ($2->type == float_type && $4->type == int_t) {
+            $$ = new Node();
+            $$->type = float_type;
+            $$->regNum = nextReg();
+            buffer->emit("CITOF F" + intToString($$->regNum) + " I" + intToString($4->regNum));
         } else {
             printSemanticError("invalid cast");
         }
@@ -560,25 +460,26 @@ EXP : EXP TADDOP EXP {
     | TID {
         if(symbolTable.find($1->str) == symbolTable.end()) printSemanticError("undeclared identifier '" + $1->str + "'");
         Symbol s = symbolTable[$1->str].back();
-        $$.type = s.type;
-        $$.regNum = nextReg();
+        $$ = new Node();
+        $$->type = s.type;
+        $$->regNum = nextReg();
         
-        string cmd = ($$.type == int_t) ? "LDI" : "LDF"; // LOADF? PDF says LOADF/LOADI? No, LOADI/LOADF.
-        // PDF table: LOADF, LOADI.
-        string regPrefix = ($$.type == int_t) ? "I" : "F";
+        string regPrefix = ($$->type == int_t) ? "I" : "F";
+        string loadCmd = ($$->type == int_t) ? "LOADI" : "LOADF";
         
-        // Load from I1 (FP) + offset
-        buffer->emit("LOAD" + string(($$.type==int_t)?"I":"F") + " " + regPrefix + intToString($$.regNum) + " I1 " + intToString(s.offset));
+        buffer->emit(loadCmd + " " + regPrefix + intToString($$->regNum) + " I1 " + intToString(s.offset));
     }
     | TNUM {
-        $$.type = int_t;
-        $$.regNum = nextReg();
-        buffer->emit("COPYI I" + intToString($$.regNum) + " " + $1->str);
+        $$ = new Node();
+        $$->type = int_t;
+        $$->regNum = nextReg();
+        buffer->emit("COPYI I" + intToString($$->regNum) + " " + $1->str);
     }
     | TREAL {
-        $$.type = float_t;
-        $$.regNum = nextReg();
-        buffer->emit("COPYF F" + intToString($$.regNum) + " " + $1->str);
+        $$ = new Node();
+        $$->type = float_type;
+        $$->regNum = nextReg();
+        buffer->emit("COPYF F" + intToString($$->regNum) + " " + $1->str);
     }
     | CALL {
         $$ = $1;
@@ -595,13 +496,10 @@ CALL : TID '(' CALL_ARGS ')' {
         vector<string> namedLabels = $3->namedLabels;
         vector<int> actualRegs = $3->paramRegs;
         
-        // Handle Named Args and Ordering
-        // Create a final ordered list of registers to push
         vector<int> orderedRegs(f.paramTypes.size(), -1);
         vector<bool> set(f.paramTypes.size(), false);
         
         int positionalCount = 0;
-        // 1. Fill positional
         for(size_t i=0; i<actualTypes.size(); ++i) {
             if(namedLabels[i] == "") {
                 if(positionalCount >= f.paramTypes.size()) printSemanticError("too many arguments");
@@ -613,11 +511,9 @@ CALL : TID '(' CALL_ARGS ')' {
             }
         }
         
-        // 2. Fill named
         for(size_t i=0; i<actualTypes.size(); ++i) {
             if(namedLabels[i] != "") {
                 string lbl = namedLabels[i];
-                // Find index
                 int idx = -1;
                 for(size_t j=0; j<f.paramNames.size(); ++j) {
                     if(f.paramNames[j] == lbl) { idx = j; break; }
@@ -630,32 +526,17 @@ CALL : TID '(' CALL_ARGS ')' {
             }
         }
         
-        // 3. Check all set
         for(size_t i=0; i<f.paramTypes.size(); ++i) {
             if(!set[i]) printSemanticError("missing argument for '" + f.paramNames[i] + "'");
         }
 
-        // --- CALL PROTOCOL ---
-        // 1. Save Caller-Saved Registers (All active temps)
-        // Active regs: 3 to currentScopeRegsNum-1.
-        // Also Float regs? We use same index for int/float regs (I3, F3).
-        // Save them to stack.
         int savedCount = 0;
         for(int i=3; i<currentScopeRegsNum; ++i) {
             buffer->emit("STORI I" + intToString(i) + " I2 " + intToString(savedCount*4));
-            buffer->emit("STORF F" + intToString(i) + " I2 " + intToString(savedCount*4 + 4)); // Save both to be safe/simple? 
-            // Optim: just save logic. But simplified: stack is cheap.
+            buffer->emit("STORF F" + intToString(i) + " I2 " + intToString(savedCount*4 + 4)); 
             savedCount += 2;
         }
         buffer->emit("ADD2I I2 I2 " + intToString(savedCount * 4));
-        
-        // 2. Push Arguments (Reverse order so Arg1 is top? No, ArgN..Arg1 usually. Or Arg1..ArgN?)
-        // FUNC_ARGS definition assumed [Arg1][OldFP].
-        // So Arg1 is at lowest address?
-        // Let's push Arg1, Arg2... ArgN. 
-        // Then I1 points to RetAddr. ArgN is at -4?
-        // Let's push in order: Arg1, Arg2...
-        // Then offsets in Callee: Arg1 is deepest.
         
         for(size_t i=0; i<orderedRegs.size(); ++i) {
             Type t = f.paramTypes[i];
@@ -664,8 +545,6 @@ CALL : TID '(' CALL_ARGS ')' {
             buffer->emit("ADD2I I2 I2 4");
         }
         
-        // 3. JLINK
-        // Backpatching logic needed if not defined?
         int callQuad = buffer->nextquad();
         buffer->emit("JLINK ");
         if(!f.defined) {
@@ -674,10 +553,8 @@ CALL : TID '(' CALL_ARGS ')' {
             buffer->backpatch(vector<int>(1, callQuad), f.startLineImplementation);
         }
         
-        // 4. Clean up Arguments
         buffer->emit("SUBTI I2 I2 " + intToString(orderedRegs.size() * 4));
         
-        // 5. Restore Registers
         buffer->emit("SUBTI I2 I2 " + intToString(savedCount * 4));
         int restoreCount = 0;
         for(int i=3; i<currentScopeRegsNum; ++i) {
@@ -686,41 +563,19 @@ CALL : TID '(' CALL_ARGS ')' {
             restoreCount += 2;
         }
         
-        // 6. Handle Return Value (in I0 or F0? Or I3/F3?)
-        // Standard: Return value in a specific register.
-        // Let's assume Callee puts result in I0/F0? But I0 is RetAddr.
-        // Let's use I3/F3 as return reg convention? But we just restored I3/F3.
-        // Solution: Callee pushes return value to stack?
-        // Or specific register unused by saving convention.
-        // Let's say Return Value is in I10/F10?
-        // Wait, reference suggestion used "LDI ... -4"?
-        // Let's make Callee put return value in I0/F0 *after* restoring I0/F0 (Wait, I0 is RetAddr).
-        // Let's use a dedicated temp reg for return?
-        // Actually, simplest: Callee puts return value in a register we define, say I0/F0 *just before RETRN*.
-        // But Caller restores I0 (RetAddr) from its own save? No, I0 is caller-saved? No.
-        // CALLER SAVED REGS.
-        // Return value: Let's use I0/F0. 
-        // 1. Callee: result -> I0/F0. RETRN.
-        // 2. Caller: JLINK (clobbers I0). Returns. I0 has return val? No, JLINK uses it.
-        // Use I3/F3?
-        // If we save/restore I3/F3, we overwrite result.
-        // FIX: Restore all *except* the register that holds the return value? 
-        // No, simplest: Use a dedicated "Return Value Register" that is NOT saved/restored.
-        // Say I11/F11.
-        
-        // We will implement: Return val in I11 / F11.
-        $$.regNum = nextReg();
-        $$.type = f.returnType;
+        $$ = new Node();
+        $$->regNum = nextReg();
+        $$->type = f.returnType;
         if(f.returnType != void_t) {
             string p = (f.returnType == int_t) ? "I" : "F";
-            buffer->emit("COPY" + p + " " + p + intToString($$.regNum) + " " + p + "11");
+            buffer->emit("COPY" + p + " " + p + intToString($$->regNum) + " " + p + "11");
         }
     }
     ;
 
 CALL_ARGS : CALL_ARGS_LIST { $$ = $1; }
           | /* EPSILON */ { 
-              $$.node = new Node();
+              $$ = new Node();
           }
           ;
 
@@ -729,27 +584,30 @@ CALL_ARGS_LIST : CALL_ARG_ITEM {
            }
            | CALL_ARGS_LIST ',' CALL_ARG_ITEM {
                $$ = $1;
-               $$.namedLabels.push_back($3->namedLabels[0]);
-               $$.paramTypes.push_back($3->paramTypes[0]);
-               $$.paramRegs.push_back($3->paramRegs[0]);
+               $$->namedLabels.push_back($3->namedLabels[0]);
+               $$->paramTypes.push_back($3->paramTypes[0]);
+               $$->paramRegs.push_back($3->paramRegs[0]);
            }
            ;
 
 CALL_ARG_ITEM : EXP {
-              $$.namedLabels.push_back("");
-              $$.paramTypes.push_back($1->type);
-              $$.paramRegs.push_back($1->regNum);
+              $$ = new Node();
+              $$->namedLabels.push_back("");
+              $$->paramTypes.push_back($1->type);
+              $$->paramRegs.push_back($1->regNum);
           }
           | TID ':' EXP {
-              $$.namedLabels.push_back($1->str);
-              $$.paramTypes.push_back($3->type);
-              $$.paramRegs.push_back($3->regNum);
+              $$ = new Node();
+              $$->namedLabels.push_back($1->str);
+              $$->paramTypes.push_back($3->type);
+              $$->paramRegs.push_back($3->regNum);
           }
           ;
 
 WRITE : TWRITE '(' EXP ')' ';' {
         if ($3->type == int_t) buffer->emit("PRNTI I" + intToString($3->regNum));
         else buffer->emit("PRNTF F" + intToString($3->regNum));
+        $$ = new Node();
     }
     | TWRITE '(' TSTR ')' ';' {
         string s = $3->str;
@@ -759,11 +617,11 @@ WRITE : TWRITE '(' EXP ')' ';' {
                  if(s[i+1] == 'n') val = "10";
                  if(s[i+1] == 't') val = "9";
                  if(s[i+1] == '"') val = "34";
-                 // skip next char
                  i++;
              }
              buffer->emit("PRNTC " + val);
         }
+        $$ = new Node();
     }
     ;
 
@@ -777,6 +635,7 @@ READ : TREAD '(' LVAL ')' ';' {
            buffer->emit("READF F" + intToString(r));
            buffer->emit("STORF F" + intToString(r) + " I1 " + intToString($3->offset));
        }
+       $$ = new Node();
     }
     ;
 
@@ -784,31 +643,14 @@ RETURN : TRET EXP ';' {
     if(currentReturnType == void_t) printSemanticError("void function cannot return value");
     if(currentReturnType != $2->type) printSemanticError("return type mismatch");
     
-    // Put return value in I11/F11
     string p = ($2->type == int_t) ? "I" : "F";
     buffer->emit("COPY" + p + " " + p + "11 " + p + intToString($2->regNum));
     
-    // Epilogue logic duplicated here to ensure we return immediately
     buffer->emit("COPYI I2 I1");
-    buffer->emit("LOADI I1 I1 0");
-    // We assume RetAddr is in I0. But in nested calls I0 is clobbered.
-    // So we must load RetAddr from stack before returning.
-    // In Prologue: STORI I0 I2 4. (FP points to I1).
-    // So RetAddr is at FP-4? No.
-    // Prologue: 
-    // STORI I1 I2 0. ADD2I I2 8. COPYI I1 I2.
-    // [OldFP] is at I2-8 => I1-8?
-    // Wait.
-    // SP=0.
-    // STORI I1 SP 0. (Mem[0]=OldFP).
-    // STORI I0 SP 4. (Mem[4]=RetAddr).
-    // ADD SP 8. (SP=8).
-    // FP = SP. (FP=8).
-    // So OldFP is at FP-8. RetAddr is at FP-4.
-    
     buffer->emit("LOADI I0 I1 -4");
     buffer->emit("LOADI I1 I1 -8");
     buffer->emit("RETRN");
+    $$ = new Node();
 }
 | TRET ';' {
     if(currentReturnType != void_t) printSemanticError("non-void function must return value");
@@ -816,12 +658,17 @@ RETURN : TRET EXP ';' {
     buffer->emit("LOADI I0 I1 -4");
     buffer->emit("LOADI I1 I1 -8");
     buffer->emit("RETRN");
+    $$ = new Node();
 }
 ;
 
-M : /* EPSILON */ { $$.quad = buffer->nextquad(); } ;
+M : /* EPSILON */ { 
+    $$ = new Node();
+    $$->quad = buffer->nextquad(); 
+} ;
 N : /* EPSILON */ { 
-    $$.nextList.push_back(buffer->nextquad());
+    $$ = new Node();
+    $$->nextList.push_back(buffer->nextquad());
     buffer->emit("UJUMP "); 
 } ;
 
@@ -844,7 +691,6 @@ int main(int argc, char* argv[]) {
     
     fclose(yyin);
     
-    // Header Generation
     string outName = fname.substr(0, fname.find_last_of(".")) + ".rsk";
     ofstream out(outName.c_str());
     
@@ -853,7 +699,6 @@ int main(int argc, char* argv[]) {
     string unimpl = "<unimplemented>";
     string impl = "<implemented>";
     
-    // Format: name,lines...
     for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); ++it) {
         if(it->second.defined) {
              impl += " " + it->first + "," + intToString(it->second.startLineImplementation);

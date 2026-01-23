@@ -1,106 +1,91 @@
-#pragma once
+#ifndef PART3_HELPERS_HPP
+#define PART3_HELPERS_HPP
 
 #include <string>
 #include <vector>
-#include <unordered_map>
+#include <map>
+#include <iostream>
 
-// -----------------------------
-// Types + attributes
-// -----------------------------
-enum class Type { INT, FLOAT, VOID, STR };
+using namespace std;
 
-struct Attr {
-  Type type = Type::VOID;
+// Error codes
+#define LEXICAL_ERROR     1
+#define SYNTAX_ERROR      2
+#define SEMANTIC_ERROR    3
+#define OPERATIONAL_ERROR 4
 
-  // For EXP/LVAL temporaries
-  int reg = -1;
-
-  // For identifiers and strings
-  std::string str;
-
-  // Backpatch lists
-  std::vector<int> trueList;
-  std::vector<int> falseList;
-  std::vector<int> nextList;
-
-  // Marker quad
-  int quad = -1;
-
-  // For function signatures
-  std::vector<Type> paramTypes;
-  std::vector<std::string> paramNames;
-
-  // For call args
-  std::vector<int> argRegs;            // regs carrying each arg value
-  std::vector<std::string> argNames;   // "" for positional, name for named
-
-  // For multi-decl: id, id, id...
-  std::vector<std::string> names;
+// Types
+enum Type {
+    void_t,
+    int_t,
+    float_t
 };
 
-struct VarBinding {
-  Type type = Type::VOID;
-  int offset = 0;      // bytes from FP (I1). locals >= 0, params < 0
-  int scopeDepth = 0;
+// Semantic value struct (Node)
+struct Node {
+    string str;
+    Type type = void_t;
+    
+    // Register number allocated for this expression
+    int regNum = -1;
+    
+    // Offset in stack (for variables)
+    int offset = 0;
+    
+    // Quad number (for markers)
+    int quad = 0;
+    
+    // Backpatching lists
+    vector<int> nextList;
+    vector<int> trueList;
+    vector<int> falseList;
+
+    // For declarations / function parameters
+    vector<string> paramNames;
+    vector<Type> paramTypes;
+    vector<int> paramRegs; // For call arguments
+    
+    // For named arguments
+    vector<string> namedLabels;
+    vector<int> namedRegs;
+    vector<Type> namedTypes;
 };
 
-struct FunctionInfo {
-  Type retType = Type::VOID;
-  std::vector<Type> paramTypes;
-  std::vector<std::string> paramNames;
-
-  bool isDefined = false;
-  int startLineImplementation = 0;
-
-  // All call sites (lines of JLINK instructions)
-  std::vector<int> callLines;
-
-  // Only those call sites not yet patched to a local implementation
-  std::vector<int> unresolvedCallLines;
-};
-
-// -----------------------------
-// Code buffer (1-based "line numbers")
-// -----------------------------
+// Global Helper Classes
 class CodeBuffer {
 public:
-  int nextQuad() const;  // 1-based next line index
-  void emit(const std::string& line);
-  void backpatch(const std::vector<int>& list, int label);
-  std::string str() const;
+    CodeBuffer();
+    void emit(const string& str);
+    void emit_front(const string& str);
+    void backpatch(const vector<int>& lst, int line);
+    int nextquad();
+    string printBuffer();
 
 private:
-  std::vector<std::string> m_lines;
+    vector<string> data;
 };
 
-// -----------------------------
-// Globals used by lex/yacc
-// -----------------------------
-extern CodeBuffer g_code;
-extern std::string g_curr_lexeme;
+struct Function {
+    Type returnType;
+    vector<Type> paramTypes;
+    vector<string> paramNames; // Needed for named args
+    int startLineImplementation;
+    bool defined;
+    vector<int> callingLines;
+};
 
-extern std::unordered_map<std::string, FunctionInfo> g_functions;
+struct Symbol {
+    int offset;
+    Type type;
+};
 
-// yy line number (flex %option yylineno)
-extern int yylineno;
+// Helpers
+string intToString(int i);
+template <typename T>
+vector<T> merge(const vector<T>& l1, const vector<T>& l2) {
+    vector<T> ret = l1;
+    ret.insert(ret.end(), l2.begin(), l2.end());
+    return ret;
+}
 
-// Final output (driver writes it to .rsk)
-extern std::string g_final_output;
-
-// -----------------------------
-// Exit codes
-// -----------------------------
-constexpr int LEXICAL_ERROR = 1;
-constexpr int SYNTAX_ERROR = 2;
-constexpr int SEMANTIC_ERROR = 3;
-constexpr int OPERATIONAL_ERROR = 4;
-
-// -----------------------------
-// Error helpers
-// -----------------------------
-void reportLexicalErrorAndExit(const std::string& lexeme, int line);
-void reportSyntaxErrorAndExit(const std::string& lexeme, int line);
-void reportSemanticErrorAndExit(const std::string& msg, int line);
-void reportOperationalErrorAndExit(const std::string& msg);
-
-std::string typeToString(Type t);
+#endif

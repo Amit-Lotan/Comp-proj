@@ -15,7 +15,6 @@ void CodeBuffer::emit_front(const string& str) {
 
 void CodeBuffer::backpatch(const vector<int>& lst, int line) {
     for (size_t i=0; i < lst.size(); ++i) {
-        // Line numbers are 1-based, vector index is 0-based
         int index = lst[i] - 1;
         if(index >= 0 && index < data.size()) {
             data[index] += intToString(line) + " ";

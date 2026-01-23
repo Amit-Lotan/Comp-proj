@@ -688,8 +688,18 @@ int main(int argc, char* argv[]) {
     yyin = fopen(argv[1], "r");
     if(!yyin) printOperationalError("cannot open input file");
     
+    // Jump to main at start
+    buffer->emit("UJUMP ");
+    int bootQuad = 1;
+    
     yyparse();
     fclose(yyin);
+    
+    if (functionTable.find("main") != functionTable.end()) {
+        buffer->backpatch(vector<int>(1, bootQuad), functionTable["main"].startLineImplementation);
+    } else {
+        printSemanticError("Program must have a main function");
+    }
     
     string outName = fname.substr(0, fname.find_last_of(".")) + ".rsk";
     ofstream out(outName.c_str());

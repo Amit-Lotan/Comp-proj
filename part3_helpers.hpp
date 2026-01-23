@@ -18,7 +18,7 @@ using namespace std;
 enum Type {
     void_t,
     int_t,
-    float_t
+    float_type // Renamed from float_t to avoid <cmath> collision
 };
 
 // Semantic value struct (Node)

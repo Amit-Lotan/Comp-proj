@@ -82,7 +82,6 @@ COMMENT       \#.*
                         return TK_STR;
                     }
 
-/* Properly terminated string, but contains an illegal escape like \q */
 {BADSTR}            {
                         std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
                         std::exit(LEXICAL_ERROR);

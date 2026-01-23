@@ -1,114 +1,148 @@
-%{
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
+%option noyywrap
+%option yylineno
 
-#include "part3_helpers.hpp"
-#include "part3.tab.hpp"
+%{
+  #include <string>
+  #include "part3_helpers.hpp"
+
+  // Robust include for bison header name
+  #if __has_include("part3.tab.hpp")
+    #include "part3.tab.hpp"
+  #else
+    #include "part3.tab.h"
+  #endif
+
+  #define SET_LEXEME() do { g_curr_lexeme = yytext; } while(0)
+
+  static std::string unescape_string(const std::string& s) {
+    // s includes the surrounding quotes
+    std::string out;
+    for (size_t i = 1; i + 1 < s.size(); ++i) {
+      char c = s[i];
+      if (c == '\\') {
+        if (i + 1 >= s.size() - 1) {
+          return ""; // invalid escape
+        }
+        char n = s[++i];
+        if (n == 'n') out.push_back('\n');
+        else if (n == 't') out.push_back('\t');
+        else if (n == '\"') out.push_back('\"');
+        else return ""; // invalid escape
+      } else {
+        out.push_back(c);
+      }
+    }
+    return out;
+  }
 %}
 
-%option noyywrap yylineno nodefault
-%option noinput nounput
-
-ID            [A-Za-z][A-Za-z0-9_]*
-INTEGERNUM    [0-9]+
-REALNUM       [0-9]+\.[0-9]+
-RELOP         (==|<>|<=|>=|<|>)
-ADDOP         (\+|-)
-MULOP         (\*|\/)
-STR           \"([^\"\\\n\r]|\\[tn\"\\])*\"
-BADSTR        \"([^\"\\\n\r]|\\.)*\"
-
-WS            [ \t\r]+
-COMMENT       \#.*
+DIGIT     [0-9]
+ID        [A-Za-z_][A-Za-z0-9_]*
+INTNUM    {DIGIT}+
+REALNUM   {DIGIT}+"."{DIGIT}+
+WS        [ \t\r]+
 
 %%
 
-{WS}                { /* skip */ }
-{COMMENT}           { /* skip */ }
-\n                  { /* yylineno is updated automatically */ }
+{WS}                  { /* skip */ }
+"//".*                { /* skip comment */ }
+\n                    { /* flex updates yylineno */ }
 
-"int"               { return TK_INT; }
-"float"             { return TK_FLOAT; }
-"void"              { return TK_VOID; }
-"if"                { return TK_IF; }
-"then"              { return TK_THEN; }
-"else"              { return TK_ELSE; }
-"while"             { return TK_WHILE; }
-"do"                { return TK_DO; }
-"read"              { return TK_READ; }
-"write"             { return TK_WRITE; }
-"return"            { return TK_RETURN; }
+"int"                 { SET_LEXEME(); return TK_INT; }
+"float"               { SET_LEXEME(); return TK_FLOAT; }
+"void"                { SET_LEXEME(); return TK_VOID; }
 
-"&&"                { return TK_AND; }
-"||"                { return TK_OR; }
-"!"                 { return TK_NOT; }
-"="                 { return TK_ASSIGN; }
+"if"                  { SET_LEXEME(); return TK_IF; }
+"then"                { SET_LEXEME(); return TK_THEN; }
+"else"                { SET_LEXEME(); return TK_ELSE; }
+"while"               { SET_LEXEME(); return TK_WHILE; }
+"do"                  { SET_LEXEME(); return TK_DO; }
+"return"              { SET_LEXEME(); return TK_RETURN; }
+"read"                { SET_LEXEME(); return TK_READ; }
+"write"               { SET_LEXEME(); return TK_WRITE; }
 
-"("                 { return '('; }
-")"                 { return ')'; }
-"{"                 { return '{'; }
-"}"                 { return '}'; }
-","                 { return ','; }
-";"                 { return ';'; }
-":"                 { return ':'; }
+"&&"                  { SET_LEXEME(); return TK_AND; }
+"||"                  { SET_LEXEME(); return TK_OR; }
+"!"                   { SET_LEXEME(); return TK_NOT; }
 
-{RELOP}             {
-                        yylval.a = new Attr();
-                        yylval.a->str = yytext;
-                        return TK_RELOP;
-                    }
+"=="|"<>"|"<="|">="|"<"|">"  {
+  SET_LEXEME();
+  yylval = new Attr();
+  yylval->str = yytext;
+  return TK_RELOP;
+}
 
-{ADDOP}             {
-                        yylval.a = new Attr();
-                        yylval.a->str = yytext;
-                        return TK_ADDOP;
-                    }
+"+"|"-"               {
+  SET_LEXEME();
+  yylval = new Attr();
+  yylval->str = yytext;
+  return TK_ADDOP;
+}
 
-{MULOP}             {
-                        yylval.a = new Attr();
-                        yylval.a->str = yytext;
-                        return TK_MULOP;
-                    }
+"*"|"/"               {
+  SET_LEXEME();
+  yylval = new Attr();
+  yylval->str = yytext;
+  return TK_MULOP;
+}
 
-{STR}               {
-                        std::string s(yytext);
-                        yylval.a = new Attr();
-                        if (s.size() >= 2) {
-                            yylval.a->str = s.substr(1, s.size() - 2);
-                        } else {
-                            yylval.a->str.clear();
-                        }
-                        return TK_STR;
-                    }
+"="                   { SET_LEXEME(); return '='; }
+";"                   { SET_LEXEME(); return ';'; }
+","                   { SET_LEXEME(); return ','; }
+":"                   { SET_LEXEME(); return ':'; }
+"("                   { SET_LEXEME(); return '('; }
+")"                   { SET_LEXEME(); return ')'; }
+"{"                   { SET_LEXEME(); return '{'; }
+"}"                   { SET_LEXEME(); return '}'; }
 
-/* Properly terminated string, but contains an illegal escape like \q */
-{BADSTR}            {
-                        std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
-                        std::exit(LEXICAL_ERROR);
-                    }
+{REALNUM}             {
+  SET_LEXEME();
+  yylval = new Attr();
+  yylval->type = Type::FLOAT;
+  yylval->str = yytext;
+  return TK_REALNUM;
+}
 
-{REALNUM}            {
-                        yylval.a = new Attr();
-                        yylval.a->str = yytext;
-                        return TK_REALNUM;
-                    }
+{INTNUM}              {
+  SET_LEXEME();
+  yylval = new Attr();
+  yylval->type = Type::INT;
+  yylval->str = yytext;
+  return TK_INTNUM;
+}
 
-{INTEGERNUM}         {
-                        yylval.a = new Attr();
-                        yylval.a->str = yytext;
-                        return TK_INTEGERNUM;
-                    }
+\"([^\\\"\n]|\\[nt\"])*
+\"                     {
+  // This rule is here only so flex doesn't treat stray quotes as separate tokens.
+  // Actual complete strings are handled below.
+  SET_LEXEME();
+  reportLexicalErrorAndExit(g_curr_lexeme, yylineno);
+}
 
-{ID}                 {
-                        yylval.a = new Attr();
-                        yylval.a->str = yytext;
-                        return TK_ID;
-                    }
+\"([^\\\"\n]|\\[nt\"])*
+\"([^\\\"\n]|\\[nt\"])*\"  {
+  SET_LEXEME();
+  std::string raw = yytext;
+  std::string val = unescape_string(raw);
+  if (val.empty() && raw != "\"\"") {
+    reportLexicalErrorAndExit(raw, yylineno);
+  }
+  yylval = new Attr();
+  yylval->type = Type::STR;
+  yylval->str = val;
+  return TK_STRING;
+}
 
-.                    {
-                        std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
-                        std::exit(LEXICAL_ERROR);
-                    }
+{ID}                  {
+  SET_LEXEME();
+  yylval = new Attr();
+  yylval->str = yytext;
+  return TK_ID;
+}
+
+.                     {
+  SET_LEXEME();
+  reportLexicalErrorAndExit(g_curr_lexeme, yylineno);
+}
 
 %%

@@ -1,42 +1,32 @@
-#include "part3_helpers.hpp"
-#include <sstream>
+#include "part3_helper.hpp"
 
-CodeBuffer::CodeBuffer(){
-    data.clear();
+// C'tor of Buffer class
+Buffer::Buffer(){
+	data.clear();
 }
 
-void CodeBuffer::emit(const string& str) {
-    data.push_back(str);
+void Buffer::emit(const string& str) {
+	data.push_back(str);
 }
 
-void CodeBuffer::emit_front(const string& str) {
-    data.insert(data.begin(), str);
+void Buffer::emit_front(const string& str) {
+	data.insert(data.begin(), str);
 }
 
-void CodeBuffer::backpatch(const vector<int>& lst, int line) {
-    for (size_t i=0; i < lst.size(); ++i) {
-        int index = lst[i] - 1;
-        // CAST added here to fix warning
-        if(index >= 0 && (size_t)index < data.size()) {
-            data[index] += intToString(line) + " ";
-        }
-    }
+void Buffer::backpatch(vector<int> lst, int line) {
+	for (unsigned i=0; i < lst.size(); ++i) {
+		data[lst[i] - 1] += intToString(line) +" ";
+	}
 }
 
-int CodeBuffer::nextquad() {
-    return data.size() + 1;
+int Buffer::nextquad() {
+	return data.size() + 1;
 }
 
-string CodeBuffer::printBuffer() {
-    string out = "";
-    for (size_t i=0; i<data.size(); ++i) {
-        out += data[i] + "\n";
-    }
-    return out;
-}
-
-string intToString(int i) {
-    stringstream ss;
-    ss << i;
-    return ss.str();
+string Buffer::printBuffer() {
+	string out = "";
+	for (int i=0; i<data.size(); ++i) {
+		out += data[i] + "\n";
+	}
+	return out;
 }

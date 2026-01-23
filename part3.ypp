@@ -1,1015 +1,729 @@
-	%{
-	    #include "part3_helper.hpp"
-	    using namespace std;
-	    extern "C" int yylex();
-		extern int yylineno;
-		extern char* yytext;
-		extern void yylex_destroy();
-	    int yyerror(char const* s);
-	    int printOperationalError (string err);
-	    int printSemanticError(string err);
-	%}
+%{
+    #include "part3_helpers.hpp"
+    #include <iostream>
+    #include <stdlib.h>
+    #include <stdio.h>
+    #include <string>
+    #include <vector>
+    #include <map>
+    #include <algorithm>
+    #include <fstream>
 
-	%token TINT8
-	%token TINT16
-	%token TINT32
-	%token TVOID
-	%token TWRITE
-	%token TREAD
-	%token TWHILE
-	%token TDO
-	%token TRET
-	%token TID
-	%token TNUM
-	%token  TSTR
-	%right TASSIGN
-	%right TIF TELSE TTHEN
-	%left TOR 
-	%left TAND
-	%left TRELOP
-	%left TADDOP
-	%left TMULOP
-	%right TNOT
-	%left ','
-	%left '('
-	%left ')'
-	%left '{'
-	%left '}'
-	%left ':'
-	%left ';'
+    using namespace std;
 
+    extern int yylex();
+    extern int yylineno;
+    extern char* yytext;
+    extern FILE* yyin;
+    void yyerror(char const* s);
+
+    // Globals
+    CodeBuffer mainBuffer;
+    CodeBuffer* buffer = &mainBuffer;
+    
+    map<string, Function> functionTable;
+    map<string, vector<Symbol> > symbolTable;
+    
+    int currentScopeOffset = 0; 
+    int currentScopeRegsNum = 3; 
+    Type currentReturnType = void_t;
+    int currentBlockDepth = 0;
+    
+    vector<vector<string> > scopeVarNames;
+
+    void printSemanticError(string err) {
+        cerr << "Semantic error: " << err << " in line number " << yylineno << endl;
+        exit(SEMANTIC_ERROR);
+    }
+
+    void printOperationalError(string err) {
+        cerr << "Operational error: " << err << endl;
+        exit(OPERATIONAL_ERROR);
+    }
+    
+    string typeToString(Type t) {
+        if(t == int_t) return "int";
+        if(t == float_type) return "float";
+        return "void";
+    }
+
+    int nextReg() {
+        return currentScopeRegsNum++;
+    }
+%}
+
+%union {
+    Node* node;
+}
+
+%token <node> TINT TFLOAT TVOID
+%token <node> TWRITE TREAD TWHILE TDO TRET TID TNUM TREAL TSTR
+%token <node> TRELOP TADDOP TMULOP TASSIGN
+%token <node> TIF TTHEN TELSE
+%token <node> TOR TAND TNOT
+
+%type <node> PROGRAM FDEFS FUNC_HEADER FUNC_DEF_START BLK BLK_OPEN BLK_CLOSE M N
+%type <node> FUNC_ARGS FUNC_ARGLIST DCL TYPE
+%type <node> STLIST STMT ASSN EXP CALL CALL_ARGS CALL_ARGS_LIST
+%type <node> CNTRL BEXP WRITE READ LVAL RETURN
+%type <node> CALL_ARG_ITEM
+
+%right TASSIGN
+%left TOR
+%left TAND
+%left TRELOP
+%left TADDOP
+%left TMULOP
+%right TNOT
+%nonassoc TIF_NO_ELSE
+%nonassoc TELSE
+%left '(' ')'
+%left ','
 
 %%
-	PROGRAM : FDEFS {
-		// After all the functions in the file are defined, we know their starting address so we fill
-		// the holes of JLINK in the code
-		for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); it++) {
-			buffer->backpatch(it->second.callingLines, it->second.startLineImplementation);
-		}
-	}
-	;
 
-
-	FDEFS : FDEFS FUNC_API BLK M {
-		// This semantic rule indicates a function is being defined
-
-		// Check if the function has already been defined in this .cmm file before
-		if(functionTable[$2.str].defined != false) {
-			printSemanticError("redefinition of function '" + $2.str + "'");
-		}
-		else { 
-			functionTable[$2.str].defined = true; // Indicate that a function with $2.str name is defined
-		}
-		buffer->emit("RETRN");
-
-		// Initialize the relevant globals 
-		currentScopeRegsNum = 3;
-		currentScopeOffset = 0;
-		symbolTable.clear();
-		$2.paramTypes.clear();
-	}
-	| FDEFS FUNC_API ';' {
-		// This semantic rule indicates a function is being declared
-		
-		// Only if the function has'nt been defined yet, we assume it's definition exists in an outer file
-		if (functionTable[$2.str].defined != true) {
-			functionTable[$2.str].startLineImplementation = -1;
-		}
-		symbolTable.clear();
-	}
-	| /* EPSILON */ { }
-	;
-
-
-	FUNC_API : TYPE TID '(' M FUNC_ARGS ')' {
-
-		// Check if the function is main its return type
-		if ($2.str == "main" && $1.type != void_t) {
-			printSemanticError("incompatible return type of main function");
-		}
-
-		// Check if the function already exists in the function table
-		if (functionTable.find($2.str) != functionTable.end()) { 
-			//function is already in the function table.
-
-			// In case a function had already been declared and now being implemented, do some checkups:
-
-			// Check that the number of parameters match
-			if ($5.paramTypes.size() != functionTable[$2.str].paramTypes.size()) {
-				printSemanticError("conflicting number of arguments for '" + $2.str + "' function");
-			}
-			// Check arguments type compatibility
-			for (int i = 0; i < functionTable[$2.str].paramTypes.size(); i++) {
-				if (functionTable[$2.str].paramTypes[i] != $5.paramTypes[i]) {
-					printSemanticError("conflicting types for '" + $2.str + "' function");
-				}
-			}
-			// Compare return type of declared function to return type of currently defined function
-			if ($1.type != functionTable[$2.str].returnType) {
-				printSemanticError("conflicting return type for '" + $2.str + "' function");
-			}
-
-			// Only if the function has'nt been defined yet, we assume that it is currently being defined and 
-			// set its starting implemintation line in the .rsk file to be the next available address in buffer
-			if (functionTable[$2.str].defined != true) {
-				functionTable[$2.str].startLineImplementation = $4.quad;
-			}
-		}
-		else {
-			Function newFunction;
-			newFunction.returnType = $1.type;
-			newFunction.startLineImplementation = $4.quad;
-			newFunction.paramTypes = $5.paramTypes;
-			newFunction.defined = false;
-
-			// Insert to function table
-			functionTable.insert(std::pair<string,Function>($2.str, newFunction));
-		}
-		currentReturnType = $1.type;
-		$$.str = $2.str;
-		$$.type = $1.type;
-		$$.quad = $4.quad;
-		$$.paramTypes = $5.paramTypes;
-		$5.paramTypes.clear();
-	}
-	;
-
-
-	FUNC_ARGS : FUNC_ARGLIST {
-		// Here we set the offset and type of each parameter and pass it up to FUNC_ARGS 
-
-		// Offset from I1 register in the reverse direction. We save 4 bytes for function return value
-		int offset = -4;
-
-		vector<Type> paramTypesVec;
-	
-		for (int i = 0; i < currentParamInsertionOrder.size(); i++) {
-			string paramName = currentParamInsertionOrder[i];
-			Type paramType = symbolTable[paramName].type[0];
-			paramTypesVec.push_back(paramType);
-
-			if(paramType == int8) {
-				offset--;
-			}
-			else if (paramType == int16) {
-				if (offset%2 == 0) {
-					offset -=2;
-				}
-				else {
-					offset -= 3;
-				}
-			}
-			else if (paramType == int32) {
-				if (offset%4 == 0) {
-					offset -= 4;
-				}
-				else {
-					offset = offset - (offset%4) - 4;
-				}
-			}
-			symbolTable[paramName].offset[0] = offset;
-		}
-
-		$$.paramTypes = paramTypesVec;
-		currentParamInsertionOrder.clear();
-		currentScopeOffset = currentScopeOffset + offset + 4;
-	}
-	| /* EPSILON */ { }
-	;
-
-
-	FUNC_ARGLIST : FUNC_ARGLIST ',' DCL {
-		// Insert the function's parameters to a global list in the correct order
-		for(int i=tmpParamInsertionOrder.size()-1; i>=0; i--) {
-			string paramName = tmpParamInsertionOrder[i];
-			currentParamInsertionOrder.push_back(paramName);
-		}
-		tmpParamInsertionOrder.clear();
-	}
-	| DCL {
-		for(int i=tmpParamInsertionOrder.size()-1; i>=0; i--) {
-			string paramName = tmpParamInsertionOrder[i];
-			currentParamInsertionOrder.push_back(paramName);
-		}
-		tmpParamInsertionOrder.clear();
-	}
-	;
-  
-
-	BLK : '{' BLK_OPEN STLIST M BLK_CLOSE '}' {
-		buffer->backpatch($3.nextList, $4.quad);
-	}
-	;
-
-	BLK_OPEN : /* EPSILON */ {
-		// Entering a deeper block. Increase the global depth counter
-		currentBlockDepth++;
-	}
-	;
-
-
-	BLK_CLOSE : /* EPSILON */ {
-		
-		// Delete all the vars declared in the current scope when ending the current scope
-		for(std::map<string, Symbol>::iterator it = symbolTable.begin(); it != symbolTable.end(); ++it){
-			if (it->second.depth == currentBlockDepth) {
-				it->second.type.erase(currentBlockDepth);
-				it->second.offset.erase(currentBlockDepth);
-				it->second.depth--;
-			}
-		}
-		// Exiting a block. Decrease the global depth counter
-		currentBlockDepth--;
-	}
-
-
-	DCL : TID ':' TYPE {
-
-		if ($3.type == void_t) {
-			printSemanticError("variable has incompatible type 'void'");
-		}
-
-		// Check that an id with the same name does not exist in the currrent function list parameters
-		if (find(currentParamInsertionOrder.begin(), currentParamInsertionOrder.end(), $1.str) != currentParamInsertionOrder.end()) {
-			printSemanticError("redefinition of parameter '" + $1.str + "'");
-		}
-
-		prevScopeOffset = currentScopeOffset;
-		$$.str = $1.str;
-		$$.type = $3.type;
-		$$.offset = currentScopeOffset;
-
-		if( symbolTable.find($1.str) == symbolTable.end()) { 
-			// The symbol $1.str is not defined yet
-
-			Symbol s;
-			s.type[currentBlockDepth] = $3.type;
-			s.depth = currentBlockDepth;
-
-			// Increase current scope offset according to type
-			if ($3.type == int8) {
-				s.offset[currentBlockDepth] = currentScopeOffset;
-				currentScopeOffset += 1;
-			}
-			else if ($3.type == int16) {
-				if (currentScopeOffset%2 == 0) {
-					s.offset[currentBlockDepth] = currentScopeOffset;
-					
-					currentScopeOffset += 2;
-				}
-				else { 
-					// If global (offset mod 4)=1 or (offset mod 4)=3 then skip one byte and use the following two bytes
-					s.offset[currentBlockDepth] = currentScopeOffset + 1;
-					currentScopeOffset += 3;
-				}
-			}
-			else if ($3.type == int32) {
-				if (currentScopeOffset%4 == 0) {
-					s.offset[currentBlockDepth] = currentScopeOffset;
-					currentScopeOffset += 4;
-				}
-				else {
-					s.offset[currentBlockDepth] = currentScopeOffset + 4 - (currentScopeOffset%4);
-					currentScopeOffset += (4 - (currentScopeOffset%4)) + 4;
-				}
-			}
-
-			symbolTable.insert(std::pair<string, Symbol>($1.str, s));
-			tmpParamInsertionOrder.push_back($1.str);
-		}
-		else { 
-			// Identifier with this name (str) already exists. we need to check if it is in the same block level or not.
-			
-			// ERROR: a new id can't be defined with the same name as an existing id in the same level
-			if(symbolTable[$1.str].type.size() == currentBlockDepth) {
-				printSemanticError("repeated declaration of identifier '" + $1.str + "'");
-			}
-			// Add another id in the current block depth
-			else {
-				symbolTable[$1.str].depth = currentBlockDepth;
-				symbolTable[$1.str].type[currentBlockDepth] = $3.type;
-				if ($3.type == int8) {
-					symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset;
-					currentScopeOffset += 1;
-				}
-				else if ($3.type == int16) {
-					if (currentScopeOffset%2 == 0) {
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset;
-						currentScopeOffset += 2;
-					}
-					else { 
-						// If global (offset mod 4)=1 or (offset mod 4)=3 then skip one byte and use the following two bytes.
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset+1;
-						currentScopeOffset += 3;
-					}
-				}
-				else if ($3.type == int32) {
-					if (currentScopeOffset%4 == 0) {
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset;
-						currentScopeOffset += 4;
-					}
-					else {
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset + 4 - (currentScopeOffset%4);
-						currentScopeOffset += (4 - (currentScopeOffset%4)) + 4;
-					}
-				}
-			}
-		}
-	}
-	| TID ',' DCL {
-		if ($3.type == void_t) {
-			printSemanticError("variable has incompatible type 'void'");
-		}
-
-		// Check in both lists that an id with the same name does not exist in the currrent function list parameters
-		if (find(tmpParamInsertionOrder.begin(), tmpParamInsertionOrder.end(), $1.str) != tmpParamInsertionOrder.end()) {
-			printSemanticError("repeated definition of parameter '" + $1.str + "'");
-		}
-		if (find(currentParamInsertionOrder.begin(), currentParamInsertionOrder.end(), $1.str) != currentParamInsertionOrder.end()) {
-			printSemanticError("repeated definition of parameter '" + $1.str + "'");
-		}
-
-		$$.str = $1.str;
-		$$.type = $3.type;
-
-		if( symbolTable.find($1.str) == symbolTable.end()) { 
-			// The symbol is not defined yet
-
-			Symbol s;
-			s.type[currentBlockDepth] = $3.type;
-			s.depth = currentBlockDepth;
-
-			// Increase current scope offset acording to type
-			if ($3.type == int8) {
-				s.offset[currentBlockDepth] = currentScopeOffset;
-				currentScopeOffset += 1;
-			}
-			else if ($3.type == int16) {
-				if (currentScopeOffset%2 == 0) {
-					s.offset[currentBlockDepth] = currentScopeOffset;
-					
-					currentScopeOffset += 2;
-				}
-				else { 
-					// If global (offset mod 4)=1 or (offset mod 4)=3 then skip one byte and use the following two bytes
-					s.offset[currentBlockDepth] = currentScopeOffset + 1;
-					currentScopeOffset += 3;
-				}
-			}
-			else if ($3.type == int32) {
-				if (currentScopeOffset%4 == 0) {
-					s.offset[currentBlockDepth] = currentScopeOffset;
-					currentScopeOffset += 4;
-				}
-				else {
-					s.offset[currentBlockDepth] = currentScopeOffset + 4 - (currentScopeOffset%4);
-					currentScopeOffset += (4 - (currentScopeOffset%4)) + 4;
-				}
-			}
-
-			symbolTable.insert(std::pair<string, Symbol>($1.str, s));
-			tmpParamInsertionOrder.push_back($1.str);
-		}
-		else { 
-			// Identifier with this name (str) already exists. we need to check if it is in the same block level or not.
-			
-			// ERROR: a new id can't be defined with the same name as an existing id in the same level
-			if(symbolTable[$1.str].type.size() == currentBlockDepth) {
-				printSemanticError("repeated declaration of identifier '" + $1.str + "'");
-			}
-			//Add another identifier in the current block depth
-			else {
-				symbolTable[$1.str].depth = currentBlockDepth;
-				symbolTable[$1.str].type[currentBlockDepth] = $3.type;
-				if ($3.type == int8) {
-					symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset;
- 
-					currentScopeOffset += 1;
-				}
-				else if ($3.type == int16) {
-					if (currentScopeOffset%2 == 0) {
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset;
-						currentScopeOffset += 2;
-					}
-					else { 
-						// If global (offset mod 4)=1 or (offset mod 4)=3 then skip one byte and use the following two bytes
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset+1;
-						currentScopeOffset += 3;
-					}
-				}
-				else if ($3.type == int32) {
-					if (currentScopeOffset%4 == 0) {
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset;
-						currentScopeOffset += 4;
-					}
-					else {
-						symbolTable[$1.str].offset[currentBlockDepth] = currentScopeOffset + 4 - (currentScopeOffset%4);
-						currentScopeOffset += (4 - (currentScopeOffset%4)) + 4;
-					}
-				}
-			}
-		}
-	}
-
-
-	TYPE : TINT8 {
-		$$.type = int8;
-	}
-	| TINT16 {
-		$$.type = int16;
-	}
-	| TINT32 {
-		$$.type = int32;
-	}
-	| TVOID {
-		$$.type = void_t;
-	}
-	;
-
-
-	STLIST : STLIST STMT {}
-	| /* EPSILON */ {}
-	;
-
-
-	STMT : DCL ';' {
-		// Increase stack pointer size according to the new offset compared to prevScopeOffset
-		tmpParamInsertionOrder.clear();
-		currentParamInsertionOrder.clear();
-		int offsetInBytes = currentScopeOffset - prevScopeOffset;
-		buffer->emit("ADD2I I2 I2 " + intToString(offsetInBytes));
-	}
-	| ASSN {}
-	| EXP ';' {
-		if ($1.type != void_t) {
-			printSemanticError("expression has incompatible type");
-		}
-	}
-	| CNTRL M {
-		// Backpatch control statments' true and false lists
-		buffer->backpatch($1.nextList, $2.quad);
-	}
-	| READ {}
-	| WRITE {}
-	| RETURN {}
-	| BLK {}
-	;
-
-
-	RETURN : TRET EXP ';' {
-		if (currentReturnType != $2.type) {
-			printSemanticError("incompatible return type");
-		}
-		else if(currentReturnType == void_t){
-			printSemanticError("incompatible return type");
-		}
-		$$.regNum = $2.regNum;
-		int returnValueSize = $2.type / 8;
-		buffer->emit("STI" + intToString($2.type) + " I" + intToString($$.regNum) + " I1 -" + intToString(returnValueSize));
-		buffer->emit("RETRN");
-	}
-	| TRET ';' { 
-		buffer->emit("LDI32 I0 I2 4");
-		if (currentReturnType != void_t) {
-			printSemanticError("function return value is not void");
-		}
-		buffer->emit("RETRN");
-	}
-	;
-
-
-	WRITE : TWRITE '(' EXP ')' ';' {
-		if ($3.type == int32) {
-			buffer->emit("PRNTI I" + intToString($3.regNum));
-		}
-		else {
-			// Handle conversion to int32
-			$$.regNum = currentScopeRegsNum++;
-			int prevReg = $$.regNum - 1; 
-			int shiftSize = 32 - $3.type; 
-			buffer->emit("SLAI I" + intToString($$.regNum) + " I" + intToString(prevReg) + " " + intToString(shiftSize));
-			buffer->emit("SRAI I" + intToString($$.regNum) + " I" + intToString($$.regNum) + " " + intToString(shiftSize));
-			buffer->emit("PRNTI I" + intToString($$.regNum));
-		}  
-	}
-	| TWRITE '(' TSTR ')' ';' {
-		for (unsigned int i = 0 ; i < $3.str.length() ; i++) {
-			char c = $3.str[i];
-			if (c == '\\') {
-				if ($3.str[i+1] == 'n') {
-					c = '\n';
-					i++;
-				}
-				else if ($3.str[i+1] == 't') {
-					c = '\t';
-					i++;
-				}
-			}
-			int val = static_cast<int>(c);
-			buffer->emit("PRNTC " + intToString(val));
-		}
-	}
-	;
-
-
-	READ : TREAD '(' LVAL ')' ';' {
-		int tempRegister = currentScopeRegsNum++;
-		buffer->emit("READI I" + intToString(tempRegister));
-		buffer->emit("STI" + intToString($3.type) + " I" + intToString(tempRegister) + " I" + intToString($3.regNum) + " 0");
-	}
-	;
-
-
-	ASSN : LVAL TASSIGN EXP ';' {
-		Type lvalType = $1.type;
-		Type rvalType = $3.type;
-
-		// Check if both arguments are of the same type
-		if ($1.type != $3.type) {
-			printSemanticError("incompatible type of argument '" + $3.str + "'");
-		}
-		else if ($1.type == void_t) {
-			printSemanticError("can't perform this operation on void type arguments");
-		}
-		buffer->emit("STI" + intToString($1.type) + " I" + intToString($3.regNum) + " I" + intToString($1.regNum) + " 0");
-	}
-	;
-
-
-	LVAL : TID {
-		// Check that variable is declared
-		if (symbolTable.find($1.str) == symbolTable.end()) {
-			printSemanticError("use of undeclared identifier '" + $1.str + "'");
-		}
-		int depth = symbolTable[$1.str].depth;
-		$$.type = symbolTable[$1.str].type[depth];
-		
-		if ($$.type == void_t) {
-			printSemanticError("variable '" + $1.str + "' has incompatible type");
-		}
-
-		// Allocate a register for the memory offset calulation
-		$$.regNum = currentScopeRegsNum++; 
-		$$.offset = symbolTable[$1.str].offset[depth];
-		buffer->emit("ADD2I I" + intToString($$.regNum) + " I1 " + intToString($$.offset));
-	}
-	;
-
-
-	CNTRL : TIF BEXP TTHEN M STMT TELSE N M STMT {
-		buffer->backpatch($2.trueList, $4.quad);
-		buffer->backpatch($2.falseList, $8.quad);
-		$$.nextList = merge<int>($5.nextList, $7.nextList);
-		$$.nextList = merge<int>($$.nextList, $9.nextList);
-		$5.nextList.clear();
-		$9.nextList.clear();
-		$7.nextList.clear();
-	}
-	| TIF BEXP TTHEN M STMT {
-		buffer->backpatch($2.trueList, $4.quad);
-		$$.nextList = merge<int>($2.falseList, $5.nextList);
-		$2.falseList.clear();
-		$5.nextList.clear();
-	}
-	| TWHILE M BEXP TDO M STMT {
-		buffer->backpatch($3.trueList, $5.quad);
-		buffer->backpatch($6.nextList, $2.quad);
-		$$.nextList = $3.falseList;
-		// Emit to buffer UJUMP command. After backpatch the addressed would be filled
-		buffer->emit("UJUMP " + intToString($2.quad));
-	}
-	;
-
-
-	BEXP : BEXP TOR M BEXP {
-		buffer->backpatch($1.falseList, $3.quad);
-		$$.falseList = $4.falseList;
-		$$.trueList = merge<int>($1.trueList, $4.trueList);
-		$1.trueList.clear();
-		$4.trueList.clear();
-	}
-	| BEXP TAND M BEXP {
-		buffer->backpatch($1.trueList, $3.quad);
-		$$.trueList = $4.trueList;
-		$$.falseList = merge<int>($1.falseList, $4.falseList);
-		$1.falseList.clear();
-		$4.falseList.clear();
-	}
-	| TNOT BEXP {
-		$$.trueList = $2.falseList;
-		$$.falseList = $2.trueList;
-	}
-	| EXP TRELOP EXP {
-		int leftRegister = $1.regNum;
-		int rightRegister = $3.regNum;
-
-		// Check if both arguments are of the same type
-		if ($1.type != $3.type) {
-			printSemanticError("incompatible type of arguments");
-		}
-		else if ($1.type == void_t) {
-			printSemanticError("can't perform this operation on 'void' type arguments");
-		}
-		$$.regNum = currentScopeRegsNum++;
-
-		// Set UJUMP for backpatch
-		$$.falseList.push_back(buffer->nextquad() + 1);
-		// Set BNEQZ for backpatch 
-		$$.trueList.push_back(buffer->nextquad() + 2);  
-		
-		if ($2.str == "==") {
-			buffer->emit("SEQUI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-			buffer->emit("BREQZ I" + intToString($$.regNum) + " ");
-		} 
-		else if ($2.str== "<>") {
-			buffer->emit("SNEQI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-			buffer->emit("BREQZ I" + intToString($$.regNum) + " ");
-		} 
-		else if ($2.str== "<=") {
-			buffer->emit("SGRTI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-			buffer->emit("BNEQZ I" + intToString($$.regNum) + " ");
-		} 
-		else if ($2.str== "<") {
-			buffer->emit("SLETI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-			buffer->emit("BREQZ I" + intToString($$.regNum) + " ");
-		} 
-		else if ($2.str== ">=") {
-			buffer->emit("SLETI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-			buffer->emit("BNEQZ I" + intToString($$.regNum) + " ");
-		} 
-		else if ($2.str== ">") {
-			buffer->emit("SGRTI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-			buffer->emit("BREQZ I" + intToString($$.regNum) + " ");
-		}
-		buffer->emit("UJUMP ");
-	}
-	| '(' BEXP ')' {
-		$$.trueList = $2.trueList;
-		$$.falseList = $2.falseList;
-	}
-	;
- 
-
-
-	EXP : EXP TADDOP EXP {
-
-		int leftRegister = $1.regNum;
-		int rightRegister = $3.regNum;
-
-		if ($1.type == void_t || $3.type == void_t) {
-			printSemanticError("expression has incompatible type 'void'");
-		}
-
-		// Check if both arguments are of the same type
-		else if ($1.type != $3.type) {
-			printSemanticError("incompatible type of arguments");
-		}
-		
-		$$.type = $1.type;
-		$$.regNum = currentScopeRegsNum++;
-
-		if ($2.str== "+") {
-			buffer->emit("ADD2I I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-		}
-		else {
-			buffer->emit("SUBTI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-		}
-
-	}
-	| EXP TMULOP EXP {
-
-		int leftRegister = $1.regNum;
-		int rightRegister = $3.regNum;
-
-		// Check if both arguments are of the same type
-		if ($1.type != $3.type) {
-			printSemanticError("incompatible type of arguments");
-		}
-		else if ($1.type == void_t) {
-			printSemanticError("can't perform this operation on 'void' type argument");
-		}
-		$$.type = $1.type;
-		$$.regNum = currentScopeRegsNum++;
-
-		if ($2.str== "*") {
-			buffer->emit("MULTI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-		}
-		else {
-			buffer->emit("DIVDI I" + intToString($$.regNum) + " I" + intToString(leftRegister) + " I" + intToString(rightRegister));
-		}
-	}
-	| '(' EXP ')' {
-		$$ = $2;
-	}
-	| '(' TYPE ')' EXP {
-		if ($2.type != void_t && $4.type == void_t) {
-			printSemanticError("can't perform this operation on 'void' type argument");
-		}
-
-		if ($2.type == $4.type) {
-			$$ = $4;
-		}
-		else if ($2.type > $4.type) {
-			$$.regNum = currentScopeRegsNum++;
-			$$.type = $2.type;
-			$$.offset = $4.offset;
-			int prevReg = $$.regNum - 1;
-			int shiftSize =  32 - $4.type;			
-			buffer->emit("SLAI I" + intToString($$.regNum) + " I" + intToString(prevReg) + " " + intToString(shiftSize));
-			buffer->emit("SRAI I" + intToString($$.regNum) + " I" + intToString($$.regNum) + " " + intToString(shiftSize));
-
-			if($2.type == int16) {
-				// Decimal 65535 is equal to 16 bits of '1'
-				buffer->emit("ANDI I" + intToString($$.regNum) + " I" + intToString($$.regNum) + " 65535"); 
-			}
-		}
-		else if ($4.type > $2.type) {
-			$$.regNum = currentScopeRegsNum++;
-			$$.type = $2.type;
-			$$.offset = $4.offset;
-			int prevReg = $$.regNum - 1;
-			if($2.type == int16){
-				buffer->emit("ANDI I" + intToString($$.regNum) + " I" + intToString(prevReg) + " 65535");
-			}
-			else if ($2.type == int8) {
-				buffer->emit("ANDI I" + intToString($$.regNum) + " I" + intToString(prevReg) + " 255");
-			}
-		}
-	}
-	| TID {
-		// Check that variable is declared
-		if (symbolTable.find($1.str) == symbolTable.end()) {
-			printSemanticError("use of undeclared identifier '" + $1.str + "'");
-		}
-		int depth = symbolTable[$1.str].depth;
-		$$.type = symbolTable[$1.str].type[depth];
-		$$.regNum = currentScopeRegsNum++;
-		$$.offset = symbolTable[$1.str].offset[depth];
-		
-		buffer->emit("LDI" + intToString($$.type) + " I" + intToString($$.regNum) + " I1 " + intToString($$.offset));
-	}
-	| TNUM {
-		$$.type = int32;
-		$$.regNum = currentScopeRegsNum++;
-		$$.str = $1.str;
-		buffer->emit("COPYI I" + intToString($$.regNum) + " " + $1.str);
-	}
-	| CALL {
-		$$.regNum = $1.regNum;
-		$$.type = $1.type;
-	}
-	;
- 
-
-
-	CALL : TID '(' CALL_ARGS ')' {
-
-		string funcName = $1.str;
-
-		// Check if function name was declared
-		if (functionTable.find(funcName) == functionTable.end()) {
-			printSemanticError("use of unknown function '" + funcName + "'");
-		}
-
-		// Check if number of arguments is correct
-		if (functionTable[funcName].paramTypes.size() != $3.paramTypes.size()) {
-			printSemanticError("incorrect number of arguments of function '" + funcName + "'");
-		}
-
-		//check arguments type compatibility
-		for (int i = 0; i < functionTable[funcName].paramTypes.size(); i++) {
-			if (functionTable[funcName].paramTypes[i] != $3.paramTypes[i]) {
-				printSemanticError("incompatible type of argument in function '" + funcName + "'");
-			}
-		}
-		
-		int shiftSize = 0;
-		//Allign offset to memory line (4 bytes)
-		if (currentScopeOffset%4 != 0) {
-			shiftSize = 4 - (currentScopeOffset%4);
-			currentScopeOffset += shiftSize;
-			buffer->emit("ADD2I I2 I2 " + intToString(shiftSize));
-		}
-		// Save all registers to memory
-		int offset = 0;
-
-		for (int i = 0; i < currentScopeRegsNum; ++i) {
-			buffer->emit("STI32 I" + intToString(i) + " I2 " + intToString(offset));
-			offset += 4;
-		}
-
-		// Add 4 bytes for storing called function return value
-		offset += 4;
-
-		int paramsCurrentOffset = -4;
-		int paramCount = $3.paramRegs.size();
-		vector<Type> paramTypes = $3.paramTypes;
-		vector<int> paramRegs = $3.paramRegs;
-		vector<int> paramOffset;
-
-		$3.paramRegs.clear();
-		$3.paramTypes.clear();
-
-		// Calculate the offset in memory to store each parameter of the called function
-		for (int i = 0; i < paramCount; i++) {
-			if (paramTypes[i] == int8) {
-				offset += 1;
-				paramsCurrentOffset--;
-			}
-			else if(paramTypes[i] == int16) {
-				if (offset%2 == 0) {
-						offset += 2;
-						paramsCurrentOffset -=2;
-					}
-					else { 
-						// If global (offset mod 4)=1 or (offset mod 4)=3 then skip one byte and use the following two bytes
-						offset += 3;
-						paramsCurrentOffset -=3;
-					}
-				}
-			else if (paramTypes[i] == int32) {
-				if (offset%4 == 0) {
-					offset += 4;
-					paramsCurrentOffset -=4;
-				}
-				else {
-					offset += (4 - (offset%4)) + 4;
-					paramsCurrentOffset = paramsCurrentOffset - (offset%4) - 4;
-				}
-			}
-			paramOffset.push_back(paramsCurrentOffset);
-		}
-		// Allign offset to memory line (4 bytes)
-		if (offset%4 != 0) {
-			offset = offset + 4 - (offset%4);
-		}
-		// Update I2 to the current memory size. update global offset
-		buffer->emit("ADD2I I2 I2 " + intToString(offset));
-		currentScopeOffset += offset;
-
-		// Set I1 = I2 
-		buffer->emit("COPYI I1 I2");
-	
-		// Store calling function parameters in stack according to each parameter's offset in memory
-		for (int i = 0; i < paramCount; i++) {
-			buffer->emit("STI" + intToString(paramTypes[i]) + " I" + intToString(paramRegs[i]) + " I1 " + intToString(paramOffset[i]));
-		}
-		
-		// Execute JUMP and LINK
-
-		// Add the current line number to the calling lines list of the current function
-		functionTable[funcName].callingLines.push_back(buffer->nextquad());
-		
-		buffer->emit("JLINK "); 
-		
-		// Back from function, set the stack frame I2 = I1
-		buffer->emit("COPYI I2 I1");
-		
-		// Set the return value to a register
-		$$.type = functionTable[funcName].returnType;
-		$$.regNum = currentScopeRegsNum;
-
-		// Load from memory the called function's return value, in case return type isn't void
-		int returnValueSize = functionTable[funcName].returnType;
-		if (returnValueSize != 0) {
-			buffer->emit("LDI" + intToString(returnValueSize) + " I" + intToString($$.regNum) + " I1 -" + intToString(returnValueSize/8));
-		}
-		buffer->emit("SUBTI I2 I2 " + intToString(offset));
-		
-		// Restore all registers from memory
-		offset = 0;
-		
-		for (int i = 0 ; i < currentScopeRegsNum ; i++) {
-			if (i == 2) {
-				offset += 4;
-				continue;
-			}
-			buffer->emit("LDI32 I" + intToString(i) + " I2 " + intToString(offset));
-			offset += 4;
-		}
-
-		// If we increased I2 in order to allign SP to memory, we need to set it back
-		if (shiftSize != 0) {
-			currentScopeOffset -= shiftSize;
-			buffer->emit("SUBTI I2 I2 " + intToString(shiftSize));
-		}
-		currentScopeRegsNum++;	
-	}
-	;
-
-
-	CALL_ARGS : CALL_ARGLIST {
-		$$.paramTypes = $1.paramTypes;	
-		$$.paramRegs = $1.paramRegs;
-		$1.paramTypes.clear();
-		$1.paramRegs.clear();
-	}
-	| /* EPSILON */ {}
-	;
-
-
-	CALL_ARGLIST : CALL_ARGLIST ',' EXP {
-		$$.paramRegs = $1.paramRegs;
-		$$.paramTypes = $1.paramTypes;
-		$$.paramRegs.push_back($3.regNum);
-		$$.paramTypes.push_back($3.type);
-		$1.paramTypes.clear();
-		$1.paramRegs.clear();
-		
-	}
-	| EXP {
-		$$.paramTypes.push_back($1.type);
-		$$.paramRegs.push_back($1.regNum);
-	}
- 	;
- 
-
-	M : /* EPSILON */ {
-		$$.quad = buffer->nextquad();
-	}
-	;
- 
-
-	N : /* EPSILON */ {
-		$$.nextList.push_back(buffer->nextquad());
-		buffer->emit("UJUMP ");
-	}
-	;
-
-%%	
-
-int main(int argc, char* argv[])
-{
-	if (argc != 2) {
-		printOperationalError("invalid number of arguments");
-	}
-	string inputFileName = argv[1];
-
-	extern FILE *yyin;
-	// Open the input file 
-	yyin = fopen(argv[1], "r");
-	if (yyin == NULL) {
-		printOperationalError("cannot open input file");
-	}
-	size_t lastindex;
-
-	lastindex = inputFileName.find_last_of(".");
-	if (inputFileName.substr(lastindex) != ".cmm") {
-		printOperationalError("invalid file type. expecting '.cmm' extension");
-	}
-	
-	buffer = &mainBuffer;
-
+PROGRAM : FDEFS {
+        for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); ++it) {
+            if(it->second.defined) {
+                buffer->backpatch(it->second.callingLines, it->second.startLineImplementation);
+            }
+        }
+    }
+    ;
+
+FDEFS : FDEFS FUNC_DEF_START BLK M {
+        buffer->backpatch($3->nextList, $4->quad);
+        buffer->emit("COPYI I2 I1");
+        buffer->emit("LOADI I1 I1 0");
+        buffer->emit("RETRN");
+        
+        symbolTable.clear();
+        scopeVarNames.clear();
+        currentScopeRegsNum = 3; 
+    }
+    | FDEFS FUNC_HEADER ';' {
+        symbolTable.clear();
+        scopeVarNames.clear();
+        currentScopeRegsNum = 3; 
+    }
+    | /* EPSILON */ { }
+    ;
+
+FUNC_HEADER : TYPE TID '(' M FUNC_ARGS ')' {
+        string name = $2->str;
+        
+        if (name == "main" && $1->type != void_t) {
+            printSemanticError("incompatible return type of main function");
+        }
+        
+        if (functionTable.find(name) != functionTable.end()) {
+             Function& f = functionTable[name];
+             if ($1->type != f.returnType) printSemanticError("conflicting return type for '" + name + "'");
+             if ($5->paramTypes.size() != f.paramTypes.size()) printSemanticError("conflicting number of arguments for '" + name + "'");
+             for(size_t i=0; i<f.paramTypes.size(); ++i) {
+                 if(f.paramTypes[i] != $5->paramTypes[i]) printSemanticError("conflicting types for '" + name + "'");
+             }
+        } else {
+             Function f;
+             f.returnType = $1->type;
+             f.paramTypes = $5->paramTypes;
+             f.paramNames = $5->paramNames;
+             f.defined = false; 
+             f.startLineImplementation = 0;
+             functionTable[name] = f;
+        }
+        
+        currentReturnType = $1->type;
+        currentScopeOffset = 0; // FP
+        
+        $$ = new Node();
+        $$->str = name;
+    }
+    ;
+
+FUNC_DEF_START : FUNC_HEADER {
+        string name = $1->str;
+        Function& f = functionTable[name];
+        
+        if (f.defined) {
+             printSemanticError("redefinition of function '" + name + "'");
+        }
+        f.defined = true;
+        f.startLineImplementation = buffer->nextquad();
+        
+        // Prologue
+        buffer->emit("STORI I1 I2 0"); // Save Old FP
+        buffer->emit("STORI I0 I2 4"); // Save RetAddr
+        buffer->emit("ADD2I I2 I2 8"); // SP += 8
+        buffer->emit("COPYI I1 I2");   // FP = SP
+        
+        $$ = $1;
+    }
+    ;
+
+FUNC_ARGS : FUNC_ARGLIST {
+        // Fix parameter offsets
+        // Stack grows UP. Caller pushes Arg1, then Arg2.
+        // Arg2 (Last) is at FP-12. Arg1 is at FP-16.
+        // General: Param[i] is at: -12 - (N-1 - i)*4
+        
+        int nParams = $1->paramNames.size();
+        scopeVarNames.push_back(vector<string>()); 
+        
+        for(int i=0; i<nParams; ++i) {
+            string pname = $1->paramNames[i];
+            Type ptype = $1->paramTypes[i];
+            
+            if(find(scopeVarNames.back().begin(), scopeVarNames.back().end(), pname) != scopeVarNames.back().end()) {
+                printSemanticError("redefinition of parameter '" + pname + "'");
+            }
+            scopeVarNames.back().push_back(pname);
+            
+            Symbol s;
+            s.type = ptype;
+            // Correct Offset Calculation:
+            s.offset = -12 - (nParams - 1 - i) * 4;
+            
+            symbolTable[pname].push_back(s);
+        }
+        
+        $$ = $1; 
+    }
+    | /* EPSILON */ { 
+        scopeVarNames.push_back(vector<string>());
+        $$ = new Node();
+    }
+    ;
+
+FUNC_ARGLIST : FUNC_ARGLIST ',' DCL {
+        $$ = $1;
+        for(size_t i=0; i<$3->paramNames.size(); ++i) {
+            $$->paramNames.push_back($3->paramNames[i]);
+            $$->paramTypes.push_back($3->paramTypes[i]);
+        }
+    }
+    | DCL {
+        $$ = $1;
+    }
+    ;
+
+DCL : TID ':' TYPE {
+        if($3->type == void_t) printSemanticError("variable has incompatible type 'void'");
+        $$ = new Node();
+        $$->paramNames.push_back($1->str);
+        $$->paramTypes.push_back($3->type);
+    }
+    | TID ',' DCL {
+        $$ = $3;
+        $$->paramNames.insert($$->paramNames.begin(), $1->str);
+        $$->paramTypes.insert($$->paramTypes.begin(), $3->paramTypes[0]); 
+    }
+    ;
+
+TYPE : TINT { $$ = new Node(); $$->type = int_t; }
+     | TFLOAT { $$ = new Node(); $$->type = float_type; }
+     | TVOID { $$ = new Node(); $$->type = void_t; }
+     ;
+
+BLK : '{' BLK_OPEN STLIST M BLK_CLOSE '}' {
+        buffer->backpatch($3->nextList, $4->quad);
+        $$ = $3; 
+    }
+    ;
+
+BLK_OPEN : /* EPSILON */ {
+        currentBlockDepth++;
+        scopeVarNames.push_back(vector<string>());
+        $$ = new Node();
+    }
+    ;
+
+BLK_CLOSE : /* EPSILON */ {
+        vector<string>& currentVars = scopeVarNames.back();
+        for(size_t i=0; i<currentVars.size(); ++i) {
+            symbolTable[currentVars[i]].pop_back();
+            if(symbolTable[currentVars[i]].empty()) {
+                symbolTable.erase(currentVars[i]);
+            }
+        }
+        scopeVarNames.pop_back();
+        currentBlockDepth--;
+        $$ = new Node();
+    }
+    ;
+
+STLIST : STLIST M STMT {
+        buffer->backpatch($1->nextList, $2->quad);
+        $$ = new Node();
+        $$->nextList = $3->nextList;
+    }
+    | /* EPSILON */ { $$ = new Node(); }
+    ;
+
+STMT : DCL ';' {
+        for(size_t i=0; i<$1->paramNames.size(); ++i) {
+            string name = $1->paramNames[i];
+            Type type = $1->paramTypes[i];
+            
+            vector<string>& vars = scopeVarNames.back();
+            if(find(vars.begin(), vars.end(), name) != vars.end()) {
+                printSemanticError("repeated declaration of identifier '" + name + "'");
+            }
+            vars.push_back(name);
+            
+            Symbol s;
+            s.type = type;
+            s.offset = currentScopeOffset; 
+            symbolTable[name].push_back(s);
+            
+            buffer->emit("ADD2I I2 I2 4"); 
+            currentScopeOffset += 4;
+        }
+        $$ = new Node();
+    }
+    | ASSN { $$ = new Node(); }
+    | EXP ';' {
+        $$ = new Node();
+    }
+    | CNTRL { $$ = $1; }
+    | READ { $$ = new Node(); }
+    | WRITE { $$ = new Node(); }
+    | RETURN { $$ = new Node(); }
+    | BLK { $$ = $1; }
+    ;
+
+ASSN : LVAL TASSIGN EXP ';' {
+        if ($1->type != $3->type) printSemanticError("type mismatch in assignment");
+        if ($1->type == void_t) printSemanticError("cannot assign to void");
+        
+        string storeCmd = ($1->type == int_t) ? "STORI" : "STORF";
+        string regPrefix = ($1->type == int_t) ? "I" : "F";
+        
+        buffer->emit(storeCmd + " " + regPrefix + intToString($3->regNum) + " I1 " + intToString($1->offset));
+        $$ = new Node();
+    }
+    ;
+
+LVAL : TID {
+        if(symbolTable.find($1->str) == symbolTable.end()) printSemanticError("undeclared identifier '" + $1->str + "'");
+        Symbol s = symbolTable[$1->str].back();
+        $$ = new Node();
+        $$->type = s.type;
+        $$->offset = s.offset;
+        $$->str = $1->str;
+    }
+    ;
+
+CNTRL : TIF BEXP TTHEN M STMT TELSE N M STMT {
+        buffer->backpatch($2->trueList, $4->quad);
+        buffer->backpatch($2->falseList, $8->quad);
+        $$ = new Node();
+        $$->nextList = merge($5->nextList, $6->nextList); 
+        $$->nextList = merge($$->nextList, $9->nextList);
+    }
+    | TIF BEXP TTHEN M STMT %prec TIF_NO_ELSE {
+        buffer->backpatch($2->trueList, $4->quad);
+        $$ = new Node();
+        $$->nextList = merge($2->falseList, $5->nextList);
+    }
+    | TWHILE M BEXP TDO M STMT {
+        buffer->backpatch($3->trueList, $5->quad);
+        buffer->backpatch($6->nextList, $2->quad); 
+        buffer->emit("UJUMP " + intToString($2->quad));
+        $$ = new Node();
+        $$->nextList = $3->falseList;
+    }
+    ;
+
+BEXP : BEXP TOR M BEXP {
+        buffer->backpatch($1->falseList, $3->quad);
+        $$ = new Node();
+        $$->trueList = merge($1->trueList, $4->trueList);
+        $$->falseList = $4->falseList;
+    }
+    | BEXP TAND M BEXP {
+        buffer->backpatch($1->trueList, $3->quad);
+        $$ = new Node();
+        $$->falseList = merge($1->falseList, $4->falseList);
+        $$->trueList = $4->trueList;
+    }
+    | TNOT BEXP {
+        $$ = new Node();
+        $$->trueList = $2->falseList;
+        $$->falseList = $2->trueList;
+    }
+    | EXP TRELOP EXP {
+        if ($1->type != $3->type) printSemanticError("type mismatch in comparison");
+        if ($1->type == void_t) printSemanticError("void in comparison");
+        
+        int r = nextReg();
+        string op = $2->str;
+        string branch;
+        
+        bool isFloat = ($1->type == float_type);
+        string suffix = isFloat ? "F" : "I";
+        string opCode;
+        
+        if (op == "==") opCode = "SEQU";
+        else if (op == "<>") opCode = "SNEQ";
+        else if (op == "<") opCode = "SLET";
+        else if (op == "<=") opCode = "SLET"; 
+        else if (op == ">") opCode = "SGRT";
+        else if (op == ">=") opCode = "SGRT"; 
+        
+        string prefix = isFloat ? "F" : "I";
+        string reg1 = prefix + intToString($1->regNum);
+        string reg2 = prefix + intToString($3->regNum);
+        
+        string destReg = (isFloat ? "F" : "I") + intToString(r);
+        
+        int resReg = r;
+        
+        if (op == "<=") {
+            buffer->emit("SGRT" + suffix + " " + destReg + " " + reg1 + " " + reg2); 
+            branch = "BREQZ"; 
+        } else if (op == ">=") {
+            buffer->emit("SLET" + suffix + " " + destReg + " " + reg1 + " " + reg2); 
+            branch = "BREQZ";
+        } else {
+            buffer->emit(opCode + suffix + " " + destReg + " " + reg1 + " " + reg2);
+            branch = "BNEQZ";
+        }
+
+        if (isFloat) {
+             int iReg = nextReg();
+             buffer->emit("CFTOI I" + intToString(iReg) + " " + destReg);
+             resReg = iReg;
+        }
+
+        $$ = new Node();
+        $$->trueList.push_back(buffer->nextquad());
+        buffer->emit(branch + " I" + intToString(resReg) + " ");
+        $$->falseList.push_back(buffer->nextquad());
+        buffer->emit("UJUMP ");
+    }
+    | '(' BEXP ')' {
+        $$ = $2;
+    }
+    ;
+
+EXP : EXP TADDOP EXP {
+        if ($1->type != $3->type) printSemanticError("type mismatch in arithmetic");
+        if ($1->type == void_t) printSemanticError("void in arithmetic");
+        
+        $$ = new Node();
+        $$->type = $1->type;
+        $$->regNum = nextReg();
+        
+        string op = $2->str;
+        string inst;
+        string prefix = ($$->type == int_t) ? "I" : "F";
+        string suffix = ($$->type == int_t) ? "I" : "F";
+        
+        if (op == "+") inst = "ADD2";
+        else inst = "SUBT";
+        
+        buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
+    }
+    | EXP TMULOP EXP {
+        if ($1->type != $3->type) printSemanticError("type mismatch in arithmetic");
+        if ($1->type == void_t) printSemanticError("void in arithmetic");
+        
+        $$ = new Node();
+        $$->type = $1->type;
+        $$->regNum = nextReg();
+        
+        string op = $2->str;
+        string inst;
+        string prefix = ($$->type == int_t) ? "I" : "F";
+        string suffix = ($$->type == int_t) ? "I" : "F";
+        
+        if (op == "*") inst = "MULT";
+        else inst = "DIVD";
+        
+        buffer->emit(inst + suffix + " " + prefix + intToString($$->regNum) + " " + prefix + intToString($1->regNum) + " " + prefix + intToString($3->regNum));
+    }
+    | '(' TYPE ')' EXP {
+        if ($2->type == $4->type) {
+            $$ = $4;
+        } else if ($2->type == int_t && $4->type == float_type) {
+            $$ = new Node();
+            $$->type = int_t;
+            $$->regNum = nextReg();
+            buffer->emit("CFTOI I" + intToString($$->regNum) + " F" + intToString($4->regNum));
+        } else if ($2->type == float_type && $4->type == int_t) {
+            $$ = new Node();
+            $$->type = float_type;
+            $$->regNum = nextReg();
+            buffer->emit("CITOF F" + intToString($$->regNum) + " I" + intToString($4->regNum));
+        } else {
+            printSemanticError("invalid cast");
+        }
+    }
+    | TID {
+        if(symbolTable.find($1->str) == symbolTable.end()) printSemanticError("undeclared identifier '" + $1->str + "'");
+        Symbol s = symbolTable[$1->str].back();
+        $$ = new Node();
+        $$->type = s.type;
+        $$->regNum = nextReg();
+        
+        string regPrefix = ($$->type == int_t) ? "I" : "F";
+        string loadCmd = ($$->type == int_t) ? "LOADI" : "LOADF";
+        
+        buffer->emit(loadCmd + " " + regPrefix + intToString($$->regNum) + " I1 " + intToString(s.offset));
+    }
+    | TNUM {
+        $$ = new Node();
+        $$->type = int_t;
+        $$->regNum = nextReg();
+        buffer->emit("COPYI I" + intToString($$->regNum) + " " + $1->str);
+    }
+    | TREAL {
+        $$ = new Node();
+        $$->type = float_type;
+        $$->regNum = nextReg();
+        buffer->emit("COPYF F" + intToString($$->regNum) + " " + $1->str);
+    }
+    | CALL {
+        $$ = $1;
+    }
+    | '(' EXP ')' { $$ = $2; }
+    ;
+
+CALL : TID '(' CALL_ARGS ')' {
+        string fname = $1->str;
+        if(functionTable.find(fname) == functionTable.end()) printSemanticError("undefined function '" + fname + "'");
+        Function& f = functionTable[fname];
+        
+        vector<Type> actualTypes = $3->paramTypes;
+        vector<string> namedLabels = $3->namedLabels;
+        vector<int> actualRegs = $3->paramRegs;
+        
+        vector<int> orderedRegs(f.paramTypes.size(), -1);
+        vector<bool> set(f.paramTypes.size(), false);
+        
+        size_t positionalCount = 0; 
+        for(size_t i=0; i<actualTypes.size(); ++i) {
+            if(namedLabels[i] == "") {
+                if(positionalCount >= f.paramTypes.size()) printSemanticError("too many arguments");
+                if(set[positionalCount]) printSemanticError("duplicate argument");
+                if(actualTypes[i] != f.paramTypes[positionalCount]) printSemanticError("type mismatch arg");
+                orderedRegs[positionalCount] = actualRegs[i];
+                set[positionalCount] = true;
+                positionalCount++;
+            }
+        }
+        
+        for(size_t i=0; i<actualTypes.size(); ++i) {
+            if(namedLabels[i] != "") {
+                string lbl = namedLabels[i];
+                int idx = -1;
+                for(size_t j=0; j<f.paramNames.size(); ++j) {
+                    if(f.paramNames[j] == lbl) { idx = j; break; }
+                }
+                if(idx == -1) printSemanticError("unknown named argument '" + lbl + "'");
+                if(set[idx]) printSemanticError("duplicate argument '" + lbl + "'");
+                if(actualTypes[i] != f.paramTypes[idx]) printSemanticError("type mismatch arg '" + lbl + "'");
+                orderedRegs[idx] = actualRegs[i];
+                set[idx] = true;
+            }
+        }
+        
+        for(size_t i=0; i<f.paramTypes.size(); ++i) {
+            if(!set[i]) printSemanticError("missing argument for '" + f.paramNames[i] + "'");
+        }
+
+        int savedCount = 0;
+        for(int i=3; i<currentScopeRegsNum; ++i) {
+            buffer->emit("STORI I" + intToString(i) + " I2 " + intToString(savedCount*4));
+            buffer->emit("STORF F" + intToString(i) + " I2 " + intToString(savedCount*4 + 4)); 
+            savedCount += 2;
+        }
+        buffer->emit("ADD2I I2 I2 " + intToString(savedCount * 4));
+        
+        for(size_t i=0; i<orderedRegs.size(); ++i) {
+            Type t = f.paramTypes[i];
+            string p = (t==int_t) ? "I" : "F";
+            buffer->emit("STOR" + p + " " + p + intToString(orderedRegs[i]) + " I2 0");
+            buffer->emit("ADD2I I2 I2 4");
+        }
+        
+        int callQuad = buffer->nextquad();
+        buffer->emit("JLINK ");
+        if(!f.defined) {
+            functionTable[fname].callingLines.push_back(callQuad);
+        } else {
+            buffer->backpatch(vector<int>(1, callQuad), f.startLineImplementation);
+        }
+        
+        buffer->emit("SUBTI I2 I2 " + intToString(orderedRegs.size() * 4));
+        
+        buffer->emit("SUBTI I2 I2 " + intToString(savedCount * 4));
+        int restoreCount = 0;
+        for(int i=3; i<currentScopeRegsNum; ++i) {
+            buffer->emit("LOADI I" + intToString(i) + " I2 " + intToString(restoreCount*4));
+            buffer->emit("LOADF F" + intToString(i) + " I2 " + intToString(restoreCount*4 + 4));
+            restoreCount += 2;
+        }
+        
+        $$ = new Node();
+        $$->regNum = nextReg();
+        $$->type = f.returnType;
+        if(f.returnType != void_t) {
+            string p = (f.returnType == int_t) ? "I" : "F";
+            buffer->emit("COPY" + p + " " + p + intToString($$->regNum) + " " + p + "11");
+        }
+    }
+    ;
+
+CALL_ARGS : CALL_ARGS_LIST { $$ = $1; }
+          | /* EPSILON */ { 
+              $$ = new Node();
+          }
+          ;
+
+CALL_ARGS_LIST : CALL_ARG_ITEM {
+               $$ = $1;
+           }
+           | CALL_ARGS_LIST ',' CALL_ARG_ITEM {
+               $$ = $1;
+               $$->namedLabels.push_back($3->namedLabels[0]);
+               $$->paramTypes.push_back($3->paramTypes[0]);
+               $$->paramRegs.push_back($3->paramRegs[0]);
+           }
+           ;
+
+CALL_ARG_ITEM : EXP {
+              $$ = new Node();
+              $$->namedLabels.push_back("");
+              $$->paramTypes.push_back($1->type);
+              $$->paramRegs.push_back($1->regNum);
+          }
+          | TID ':' EXP {
+              $$ = new Node();
+              $$->namedLabels.push_back($1->str);
+              $$->paramTypes.push_back($3->type);
+              $$->paramRegs.push_back($3->regNum);
+          }
+          ;
+
+WRITE : TWRITE '(' EXP ')' ';' {
+        if ($3->type == int_t) buffer->emit("PRNTI I" + intToString($3->regNum));
+        else buffer->emit("PRNTF F" + intToString($3->regNum));
+        $$ = new Node();
+    }
+    | TWRITE '(' TSTR ')' ';' {
+        string s = $3->str;
+        for(size_t i=0; i<s.length(); ++i) {
+             string val = intToString((int)s[i]);
+             if(s[i] == '\\' && i+1 < s.length()) {
+                 if(s[i+1] == 'n') val = "10";
+                 if(s[i+1] == 't') val = "9";
+                 if(s[i+1] == '"') val = "34";
+                 i++;
+             }
+             buffer->emit("PRNTC " + val);
+        }
+        $$ = new Node();
+    }
+    ;
+
+READ : TREAD '(' LVAL ')' ';' {
+       if($3->type == int_t) {
+           int r = nextReg();
+           buffer->emit("READI I" + intToString(r));
+           buffer->emit("STORI I" + intToString(r) + " I1 " + intToString($3->offset));
+       } else {
+           int r = nextReg();
+           buffer->emit("READF F" + intToString(r));
+           buffer->emit("STORF F" + intToString(r) + " I1 " + intToString($3->offset));
+       }
+       $$ = new Node();
+    }
+    ;
+
+RETURN : TRET EXP ';' {
+    if(currentReturnType == void_t) printSemanticError("void function cannot return value");
+    if(currentReturnType != $2->type) printSemanticError("return type mismatch");
+    
+    string p = ($2->type == int_t) ? "I" : "F";
+    buffer->emit("COPY" + p + " " + p + "11 " + p + intToString($2->regNum));
+    
+    buffer->emit("COPYI I2 I1");
+    buffer->emit("LOADI I0 I1 -4");
+    buffer->emit("LOADI I1 I1 -8");
+    buffer->emit("RETRN");
+    $$ = new Node();
+}
+| TRET ';' {
+    if(currentReturnType != void_t) printSemanticError("non-void function must return value");
+    buffer->emit("COPYI I2 I1");
+    buffer->emit("LOADI I0 I1 -4");
+    buffer->emit("LOADI I1 I1 -8");
+    buffer->emit("RETRN");
+    $$ = new Node();
+}
+;
+
+M : /* EPSILON */ { 
+    $$ = new Node();
+    $$->quad = buffer->nextquad(); 
+} ;
+N : /* EPSILON */ { 
+    $$ = new Node();
+    $$->nextList.push_back(buffer->nextquad());
+    buffer->emit("UJUMP "); 
+} ;
+
+%%
+
+int main(int argc, char* argv[]) {
+    if(argc != 2) {
+        printOperationalError("usage: rx-cc <file.cmm>");
+    }
+    
+    string fname = argv[1];
+    if(fname.substr(fname.find_last_of(".") + 1) != "cmm") {
+        printOperationalError("input file must be .cmm");
+    }
+    
+    yyin = fopen(argv[1], "r");
+    if(!yyin) printOperationalError("cannot open input file");
+    
     yyparse();
-
-	mainBuffer.emit_front("</header>");
-
-	string imp = "<implemented>";
-	string uimp = "<unimplemented>";
-
-	for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); it++) {
-		if (it->second.defined > 0) {
-			imp += " " + it->first + "," + intToString(it->second.startLineImplementation);
-		}
-		else {
-			uimp += " " + it->first;
-			for (int i = 0; i < it->second.callingLines.size(); i++) {
-				uimp += "," + intToString(it->second.callingLines[i]);
-			}
-		}
-	}
-
-	mainBuffer.emit_front(imp);
-	mainBuffer.emit_front(uimp);
-
-	mainBuffer.emit_front("<header>");
-
-	ofstream rskFile;
-	string outputFileName;
-	outputFileName = inputFileName.substr(0, lastindex) + ".rsk";
-	size_t found = outputFileName.find_last_of("/\\");
-	outputFileName = outputFileName.substr(found+1);
-
-	rskFile.open(outputFileName.c_str());
-
-	rskFile << mainBuffer.printBuffer();
-	rskFile.close();
-
-	yylex_destroy();
-	return 0;
+    
+    fclose(yyin);
+    
+    string outName = fname.substr(0, fname.find_last_of(".")) + ".rsk";
+    ofstream out(outName.c_str());
+    
+    out << "<header>" << endl;
+    
+    string unimpl = "<unimplemented>";
+    string impl = "<implemented>";
+    
+    for(map<string, Function>::iterator it = functionTable.begin(); it != functionTable.end(); ++it) {
+        if(it->second.defined) {
+             impl += " " + it->first + "," + intToString(it->second.startLineImplementation);
+        } else {
+             unimpl += " " + it->first;
+             for(size_t i=0; i<it->second.callingLines.size(); ++i) {
+                 unimpl += "," + intToString(it->second.callingLines[i]);
+             }
+        }
+    }
+    
+    out << unimpl << endl;
+    out << impl << endl;
+    out << "</header>" << endl;
+    
+    out << buffer->printBuffer();
+    out.close();
+    
+    return 0;
 }
 
-int printOperationalError (string err) {
-	cerr << "Operational error: " << err << endl;
-	exit(OPERATIONAL_ERROR);
-}
-
-int printSemanticError (string err) {
-	cerr << "Semantic error: " << err << " in line number " << yylineno << endl;
-	exit(SEMANTIC_ERROR);
-}
-
-int yyerror(char const* s) {
-	cerr << "Syntax error: '" << yytext << "' in line number " << yylineno << endl;
-	exit(SYNTAX_ERROR);
+void yyerror(char const* /*s*/) {
+    cerr << "Syntax error: '" << yytext << "' in line number " << yylineno << endl;
+    exit(SYNTAX_ERROR);
 }

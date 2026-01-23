@@ -499,7 +499,7 @@ CALL : TID '(' CALL_ARGS ')' {
         vector<int> orderedRegs(f.paramTypes.size(), -1);
         vector<bool> set(f.paramTypes.size(), false);
         
-        int positionalCount = 0;
+        size_t positionalCount = 0; // Changed to size_t
         for(size_t i=0; i<actualTypes.size(); ++i) {
             if(namedLabels[i] == "") {
                 if(positionalCount >= f.paramTypes.size()) printSemanticError("too many arguments");
@@ -720,7 +720,7 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-void yyerror(char const* s) {
+void yyerror(char const* /*s*/) {
     cerr << "Syntax error: '" << yytext << "' in line number " << yylineno << endl;
     exit(SYNTAX_ERROR);
 }

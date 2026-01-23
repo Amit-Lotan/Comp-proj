@@ -16,7 +16,6 @@ void CodeBuffer::emit_front(const string& str) {
 void CodeBuffer::backpatch(const vector<int>& lst, int line) {
     for (size_t i=0; i < lst.size(); ++i) {
         int index = lst[i] - 1;
-        // CAST added here to fix warning
         if(index >= 0 && (size_t)index < data.size()) {
             data[index] += intToString(line) + " ";
         }

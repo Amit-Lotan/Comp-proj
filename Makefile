@@ -1,31 +1,24 @@
-CXX      := g++
-CXXFLAGS := -std=c++17 -Wall -Wextra -O2
+# Makefile for part3
 
-BISON    := bison
-FLEX     := flex
+rx-cc: part3-lex.o part3.tab.o part3_helper.o
+	g++ -o $@ $^
 
-TARGET   := rx-cc
+	
+part3_helper.o : part3_helper.cpp part3_helper.hpp
+	g++ -c -o $@ part3_helper.cpp
+	
+part3.tab.o: part3.tab.cpp part3.tab.hpp
+	g++ -c -o $@ part3.tab.cpp
+	
+part3-lex.o: part3-lex.cpp part3.tab.hpp
+	g++ -c -o $@ part3-lex.cpp
 
-PARSER_SRC := part3.ypp
-LEXER_SRC  := part3.lex
-HELPERS_SRC:= part3_helpers.cpp
+part3-lex.cpp: part3.lex part3_helper.hpp part3_helper.cpp
+	flex part3.lex
 
-PARSER_OUT := part3.tab.cpp
-PARSER_HDR := part3.tab.hpp
-LEXER_OUT  := part3.yy.cpp
+part3.tab.cpp part3.tab.hpp: part3.ypp
+	bison -d part3.ypp
 
-all: $(TARGET)
-
-$(PARSER_OUT) $(PARSER_HDR): $(PARSER_SRC) part3_helpers.hpp
-	$(BISON) -d --defines=$(PARSER_HDR) -o $(PARSER_OUT) $(PARSER_SRC)
-
-$(LEXER_OUT): $(LEXER_SRC) $(PARSER_HDR) part3_helpers.hpp
-	$(FLEX) -o $(LEXER_OUT) $(LEXER_SRC)
-
-$(TARGET): $(PARSER_OUT) $(LEXER_OUT) $(HELPERS_SRC) part3_helpers.hpp
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(PARSER_OUT) $(LEXER_OUT) $(HELPERS_SRC) -lfl
-
+.PHONY: clean
 clean:
-	rm -f $(TARGET) $(PARSER_OUT) $(PARSER_HDR) $(LEXER_OUT) *.o
-
-.PHONY: all clean
+	rm -f rx-cc part3-lex.cpp *.o part3.tab.cpp part3.tab.hpp  

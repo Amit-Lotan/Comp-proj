@@ -1,69 +1,42 @@
 #include "part3_helpers.hpp"
-
-#include <iostream>
 #include <sstream>
-#include <cstdlib>
 
-CodeBuffer g_code;
-std::string g_curr_lexeme;
-
-std::unordered_map<std::string, FunctionInfo> g_functions;
-
-std::string g_final_output;
-
-int CodeBuffer::nextQuad() const {
-  return static_cast<int>(m_lines.size()) + 1;
+CodeBuffer::CodeBuffer(){
+    data.clear();
 }
 
-void CodeBuffer::emit(const std::string& line) {
-  m_lines.push_back(line);
+void CodeBuffer::emit(const string& str) {
+    data.push_back(str);
 }
 
-void CodeBuffer::backpatch(const std::vector<int>& list, int label) {
-  for (int quad : list) {
-    if (quad <= 0 || quad > static_cast<int>(m_lines.size())) {
-      reportOperationalErrorAndExit("Internal backpatch error: invalid quad index");
+void CodeBuffer::emit_front(const string& str) {
+    data.insert(data.begin(), str);
+}
+
+void CodeBuffer::backpatch(const vector<int>& lst, int line) {
+    for (size_t i=0; i < lst.size(); ++i) {
+        // Line numbers are 1-based, vector index is 0-based
+        int index = lst[i] - 1;
+        if(index >= 0 && index < data.size()) {
+            data[index] += intToString(line) + " ";
+        }
     }
-    m_lines[quad - 1] += std::to_string(label);
-  }
 }
 
-std::string CodeBuffer::str() const {
-  std::ostringstream oss;
-  for (size_t i = 0; i < m_lines.size(); ++i) {
-    oss << m_lines[i];
-    if (i + 1 < m_lines.size()) oss << "\n";
-  }
-  oss << "\n";
-  return oss.str();
+int CodeBuffer::nextquad() {
+    return data.size() + 1;
 }
 
-std::string typeToString(Type t) {
-  switch (t) {
-    case Type::INT: return "int";
-    case Type::FLOAT: return "float";
-    case Type::VOID: return "void";
-    case Type::STR: return "string";
-  }
-  return "<?>"; // unreachable
+string CodeBuffer::printBuffer() {
+    string out = "";
+    for (size_t i=0; i<data.size(); ++i) {
+        out += data[i] + "\n";
+    }
+    return out;
 }
 
-void reportLexicalErrorAndExit(const std::string& lexeme, int line) {
-  std::cerr << "Lexical error: " << lexeme << " in line " << line << std::endl;
-  std::exit(LEXICAL_ERROR);
-}
-
-void reportSyntaxErrorAndExit(const std::string& lexeme, int line) {
-  std::cerr << "Syntax error: " << lexeme << " in line " << line << std::endl;
-  std::exit(SYNTAX_ERROR);
-}
-
-void reportSemanticErrorAndExit(const std::string& msg, int line) {
-  std::cerr << "Semantic error: " << msg << " in line " << line << std::endl;
-  std::exit(SEMANTIC_ERROR);
-}
-
-void reportOperationalErrorAndExit(const std::string& msg) {
-  std::cerr << "Operational error: " << msg << std::endl;
-  std::exit(OPERATIONAL_ERROR);
+string intToString(int i) {
+    stringstream ss;
+    ss << i;
+    return ss.str();
 }

@@ -5,7 +5,6 @@
     This header contains small helper utilities shared by the Flex scanner
     and the Bison parser.
 
-    Design note:
     - Bison/Flex communicate semantic values using Attr* (pointers to heap objects).
     - Attr acts as a “bundle” of fields used by different nonterminals (expressions,
       boolean backpatch lists, argument lists, etc.). Not all fields are used everywhere.
@@ -17,7 +16,7 @@
 #include <string>
 #include <vector>
 
-// Exit codes (as required by the project PDF)
+// Exit codes
 #define LEXICAL_ERROR     1
 #define SYNTAX_ERROR      2
 #define SEMANTIC_ERROR    3
@@ -30,7 +29,7 @@ enum Type {
     float_  = 2
 };
 
-// Semantic attributes object (allocated on heap; Bison/Flex pass Attr* around)
+// Semantic attributes object (allocated on heap, Bison/Flex pass Attr* around)
 struct Attr {
     // Generic lexeme (ID, operators, literal numbers, string contents)
     std::string str;
@@ -90,7 +89,7 @@ static inline std::vector<int> mergeLists(const std::vector<int>& a, const std::
 }
 
 /*
- * CodeBuffer: a tiny “emitter” for Riski assembly.
+ * CodeBuffer: “emitter” for Riski assembly.
  *
  * - We store one instruction per string (one per line).
  * - nextQuad() returns the next instruction line number (1-based).
@@ -98,7 +97,7 @@ static inline std::vector<int> mergeLists(const std::vector<int>& a, const std::
  *    Emit jumps with a trailing space, e.g. "UJUMP " or "BNEQZ I11 ",
  *    then later backpatch(...) appends the numeric target label.
  *
- * This matches the backpatching approach taught in the course and required by the PDF.
+ * This matches the backpatching approach taught in the course.
  */
 class CodeBuffer {
 public:

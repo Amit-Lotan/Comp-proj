@@ -587,12 +587,15 @@ ASSN
             if ($1->type != $3->type) {
                 semanticError("type mismatch in assignment");
             }
-            if ($1->type == int_) {
-                g_code.emit("STORI " + Ireg($3->reg) + " I1 " + std::to_string($1->offset));
-            } else {
-                g_code.emit("STORF " + Freg($3->reg) + " I1 " + std::to_string($1->offset));
-            }
-            $$ = new Attr();
+			if ($1->type == int_) {
+				g_code.emit("STORI " + Ireg($3->reg) + " I1 " + std::to_string($1->offset));
+			} else {
+				int addrF = allocFloatReg();
+				g_code.emit("CITOF " + Freg(addrF) + " I1");
+				// Use F-register for address and append .0 to offset to make it a float constant
+				g_code.emit("STORF " + Freg($3->reg) + " " + Freg(addrF) + " " + std::to_string($1->offset) + ".0");
+			}
+			$$ = new Attr();
         }
     ;
 
@@ -617,12 +620,14 @@ READ
                 const int r = allocIntReg();
                 g_code.emit("READI " + Ireg(r));
                 g_code.emit("STORI " + Ireg(r) + " I1 " + std::to_string($3->offset));
-            } else {
-                const int r = allocFloatReg();
-                g_code.emit("READF " + Freg(r));
-                g_code.emit("STORF " + Freg(r) + " I1 " + std::to_string($3->offset));
-            }
-            $$ = new Attr();
+			} else {
+				const int r = allocFloatReg();
+				g_code.emit("READF " + Freg(r));
+				int addrF = allocFloatReg();
+				g_code.emit("CITOF " + Freg(addrF) + " I1");
+				g_code.emit("STORF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string($3->offset) + ".0");
+			}
+			$$ = new Attr();
         }
     ;
 
@@ -882,11 +887,13 @@ EXP
                 const int r = allocIntReg();
                 g_code.emit("LOADI " + Ireg(r) + " I1 " + std::to_string(vb.offset));
                 $$->reg = r;
-            } else if (vb.type == float_) {
-                const int r = allocFloatReg();
-                g_code.emit("LOADF " + Freg(r) + " I1 " + std::to_string(vb.offset));
-                $$->reg = r;
-            } else {
+			} else if (vb.type == float_) {
+				const int r = allocFloatReg();        
+				int addrF = allocFloatReg();
+				g_code.emit("CITOF " + Freg(addrF) + " I1");
+				g_code.emit("LOADF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(vb.offset) + ".0");
+				$$->reg = r;
+			} else {
                 semanticError("void variable used as a value");
             }
         }
@@ -1022,53 +1029,65 @@ CALL
             const int saveSize = 4 * saveCount;
             const int argSize = 4 * nparams;
 
+            // Save Caller-Saved Registers
             if (saveSize > 0) {
                 int offset = 0;
                 for (int r = INT_TMP_BASE; r < g_nextIntReg; ++r) {
                     g_code.emit("STORI " + Ireg(r) + " I2 " + std::to_string(offset));
                     offset += 4;
                 }
-                for (int r = FLOAT_TMP_BASE; r < g_nextFloatReg; ++r) {
-                    g_code.emit("STORF " + Freg(r) + " I2 " + std::to_string(offset));
+                const int floatLimit = FLOAT_TMP_BASE + floatTempsUsed;
+                for (int r = FLOAT_TMP_BASE; r < floatLimit; ++r) {
+                    int addrF = allocFloatReg();
+                    g_code.emit("CITOF " + Freg(addrF) + " I2");
+                    g_code.emit("STORF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(offset) + ".0");
                     offset += 4;
                 }
                 g_code.emit("ADD2I I2 I2 " + std::to_string(saveSize));
             }
 
+            // Push Arguments
             for (int i = 0; i < nparams; ++i) {
                 if (finfo.paramTypes[i] == int_) {
                     g_code.emit("STORI " + Ireg(argRegs[i]) + " I2 0");
                 } else {
-                    g_code.emit("STORF " + Freg(argRegs[i]) + " I2 0");
+                    int addrF = allocFloatReg();
+                    g_code.emit("CITOF " + Freg(addrF) + " I2");
+                    g_code.emit("STORF " + Freg(argRegs[i]) + " " + Freg(addrF) + " 0.0");
                 }
                 g_code.emit("ADD2I I2 I2 4");
             }
 
             const int callLine = g_code.nextQuad();
             g_code.emit("JLINK ");
-
             g_functions[fname].callLines.push_back(callLine);
-
             if (finfo.isDefined) {
                 g_code.backpatch(vector<int>{callLine}, finfo.startLineImplementation);
             } else {
                 g_functions[fname].unresolvedCallLines.push_back(callLine);
             }
 
+            // Cleanup Arguments
             if (argSize > 0) {
                 g_code.emit("SUBTI I2 I2 " + std::to_string(argSize));
             }
 
+            // Restore Caller-Saved Registers
             if (saveSize > 0) {
                 g_code.emit("SUBTI I4 I2 " + std::to_string(saveSize));
 
                 int offset = 0;
+                // Restore Ints
                 for (int r = INT_TMP_BASE; r < g_nextIntReg; ++r) {
                     g_code.emit("LOADI " + Ireg(r) + " I4 " + std::to_string(offset));
                     offset += 4;
                 }
-                for (int r = FLOAT_TMP_BASE; r < g_nextFloatReg; ++r) {
-                    g_code.emit("LOADF " + Freg(r) + " I4 " + std::to_string(offset));
+                
+                const int floatLimit = FLOAT_TMP_BASE + floatTempsUsed; 
+                for (int r = FLOAT_TMP_BASE; r < floatLimit; ++r) {
+                    int addrF = allocFloatReg();
+                    g_code.emit("CITOF " + Freg(addrF) + " I4");
+                    g_code.emit("LOADF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(offset) + ".0");
                     offset += 4;
                 }
 

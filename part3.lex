@@ -28,8 +28,6 @@ COMMENT       \#.*
 {COMMENT}           { /* skip */ }
 \n                  { /* yylineno updated automatically */ }
 
-/* IMPORTANT: '//' is NOT a comment in this language.
-   The tests expect it to be a lexical error on the full lexeme "//". */
 "//"                {
                         std::cerr << "Lexical error: '" << yytext
                                   << "' in line number " << yylineno << "\n";

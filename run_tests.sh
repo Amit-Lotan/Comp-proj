@@ -22,7 +22,6 @@ fi
 
 if [ "$#" -eq 0 ]; then
     echo "Usage: ./run_tests.sh <path_to_test_suite_folder>"
-    echo "Example: ./run_tests.sh proj-part3-tests-123456789-987654321"
     exit 1
 fi
 
@@ -61,15 +60,31 @@ run_test() {
     pushd "$test_path" > /dev/null
 
     # Clean up previous artifacts
-    rm -f test.rsk helper.rsk test.e my_output.txt diff.log compilation.log compilation_helper.log linker.log
+    rm -f *.rsk *.e my_output.txt diff.log
 
-    # ---------------------------------------------------------
-    # 1. RUN COMPILER (Main Test File)
-    # ---------------------------------------------------------
+    # --- STEP 1: COMPILATION ---
+    
+    # 1a. Compile test.cmm
     "$COMPILER" test.cmm > compilation.log 2>&1
     local cc_exit=$?
 
-    # CASE: Expected Compilation FAILURE (The test itself is bad code)
+    # 1b. Compile helper.cmm (if it exists)
+    local has_helper=false
+    if [[ -f "helper.cmm" ]]; then
+        # Append log to compilation.log
+        echo "--- Compiling helper.cmm ---" >> compilation.log
+        "$COMPILER" helper.cmm >> compilation.log 2>&1
+        local helper_exit=$?
+        
+        # If helper fails, treating it as a general compilation failure
+        if [ $helper_exit -ne 0 ]; then
+            cc_exit=$helper_exit
+        fi
+        has_helper=true
+    fi
+
+    # CHECK COMPILATION RESULT
+    # CASE: Expected Failure (Negative Test)
     if [ "$expect_pass" = false ]; then
         if [ $cc_exit -ne 0 ]; then
             echo -e "${GREEN}PASS (Compilation failed as expected)${NC}"
@@ -80,46 +95,28 @@ run_test() {
         return
     fi
 
-    # CASE: Expected Compilation SUCCESS
+    # CASE: Expected Success
     if [ $cc_exit -ne 0 ]; then
-        echo -e "${RED}FAIL (Compilation error in test.cmm)${NC}"
+        echo -e "${RED}FAIL (Compilation error)${NC}"
         echo "  See $test_path/compilation.log"
         popd > /dev/null
         return
     fi
 
-    # ---------------------------------------------------------
-    # 2. RUN COMPILER (Helper File)
-    # ---------------------------------------------------------
-    local has_helper=false
-    if [[ -f "helper.cmm" ]]; then
-        has_helper=true
-        "$COMPILER" helper.cmm > compilation_helper.log 2>&1
-        local helper_exit=$?
-        
-        if [ $helper_exit -ne 0 ]; then
-            echo -e "${RED}FAIL (Compilation error in helper.cmm)${NC}"
-            echo "  See $test_path/compilation_helper.log"
-            popd > /dev/null
-            return
-        fi
-    fi
-
-    # ---------------------------------------------------------
-    # 3. RUN LINKER
-    # ---------------------------------------------------------
-    # Linker requires rx-runtime.rsk in current dir
+    # --- STEP 2: LINKING ---
+    
+    # Ensure rx-runtime.rsk exists locally
     if [[ ! -f "rx-runtime.rsk" ]]; then
          cp "$ROOT_DIR/rx-runtime.rsk" . 2>/dev/null
     fi
 
-    # Construct linker arguments: Main file first (to set executable name), then helper
-    local link_args="test.rsk"
+    # Prepare linker arguments: test.rsk + helper.rsk (if exists)
+    local link_files="test.rsk"
     if [ "$has_helper" = true ]; then
-        link_args="test.rsk helper.rsk"
+        link_files="test.rsk helper.rsk"
     fi
 
-    "$LINKER" $link_args > linker.log 2>&1
+    "$LINKER" $link_files > linker.log 2>&1
     local ld_exit=$?
 
     if [ $ld_exit -ne 0 ]; then
@@ -129,9 +126,8 @@ run_test() {
         return
     fi
 
-    # ---------------------------------------------------------
-    # 4. RUN VM
-    # ---------------------------------------------------------
+    # --- STEP 3: VM EXECUTION ---
+    
     local exe_name="test.e"
     if [[ ! -f "$exe_name" ]]; then
         echo -e "${RED}FAIL (Linker succeeded but $exe_name not found)${NC}"
@@ -139,39 +135,48 @@ run_test() {
         return
     fi
 
-    # Handle input file (input.in)
-    local input_arg="input.in"
-    if [[ ! -f "input.in" ]]; then
-        # Create temp empty input if input.in doesn't exist to prevent VM hang
+    # Detect Input File (Prioritize input.input, fallback to input.in)
+    local input_arg=""
+    if [[ -f "input.input" ]]; then
+        input_arg="input.input"
+    elif [[ -f "input.in" ]]; then
+        input_arg="input.in"
+    else
         touch empty_input.tmp
         input_arg="empty_input.tmp"
     fi
 
     "$VM" "$exe_name" < "$input_arg" > my_output.txt 2>&1
     
-    # Cleanup temp input
+    # Clean temp input if created
     [ -f empty_input.tmp ] && rm empty_input.tmp
 
-    # ---------------------------------------------------------
-    # 5. COMPARE OUTPUT
-    # ---------------------------------------------------------
-    if [[ ! -f "output.out" ]]; then
-        # If output.out is missing, we warn but cannot verify correctness
+    # --- STEP 4: VERIFICATION ---
+    
+    # Detect Output File (Prioritize output.out)
+    local expected_output=""
+    if [[ -f "output.out" ]]; then
+        expected_output="output.out"
+    elif [[ -f "output.output" ]]; then
+        expected_output="output.output"
+    fi
+
+    if [[ -z "$expected_output" ]]; then
         echo -e "${YELLOW}WARN (output.out missing, cannot verify)${NC}"
     else
-        # Using diff -w to ignore whitespace changes
-        diff -w output.out my_output.txt > diff.log
+        # diff -w ignores whitespace/newline differences
+        diff -w "$expected_output" my_output.txt > diff.log
         local diff_exit=$?
 
         if [ $diff_exit -eq 0 ]; then
              echo -e "${GREEN}PASS${NC}"
         else
              echo -e "${RED}FAIL (Output mismatch)${NC}"
-             echo "  Expected (first 5 lines):"
-             head -n 5 output.out
-             echo "  Got (first 5 lines):"
+             echo "  Expected ($expected_output):"
+             head -n 5 "$expected_output"
+             echo "  Got:"
              head -n 5 my_output.txt
-             echo "  (See $test_path/diff.log for full details)"
+             echo "  (See $test_path/diff.log)"
         fi
     fi
 
@@ -187,6 +192,10 @@ for i in {1..10}; do
     if [[ -d "$target_folder" ]]; then
         run_test "$target_folder"
     else
-        echo -e "${YELLOW}Directory test$i not found, skipping...${NC}"
+        # Optional: verify if folder exists before warning, 
+        # or just silently finish if fewer than 10 tests.
+        if [ -d "$target_folder" ]; then
+             echo -e "${YELLOW}Directory test$i not found${NC}"
+        fi
     fi
 done

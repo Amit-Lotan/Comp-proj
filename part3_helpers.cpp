@@ -1,13 +1,24 @@
 #include "part3_helpers.hpp"
 
+/*
+ * nextQuad():
+ *  Riski instruction addresses are *line numbers*, starting at 1.
+ *  Since m_lines holds already-emitted lines, the next quad is size()+1.
+ */
 int CodeBuffer::nextQuad() const {
     return static_cast<int>(m_lines.size()) + 1;
 }
 
+/* Append one instruction line (without a trailing newline). */
 void CodeBuffer::emit(const std::string& line) {
     m_lines.push_back(line);
 }
 
+/*
+ * backpatch():
+ *  For each line number in lst, append the numeric label to the end of that line.
+ *  This assumes the emitted line ends with a space (e.g., "UJUMP ").
+ */
 void CodeBuffer::backpatch(const std::vector<int>& lst, int label) {
     const std::string lab = std::to_string(label);
     for (int lineNo : lst) {
@@ -26,6 +37,11 @@ const std::vector<std::string>& CodeBuffer::getLines() const {
     return m_lines;
 }
 
+/*
+ * patchLine():
+ *  Utility to replace a specific instruction. Used sparingly (most patching is done by
+ *  backpatch()). No-op if lineNo is out of range.
+ */
 void CodeBuffer::patchLine(int lineNo, const std::string& newLine) {
     if (lineNo <= 0) {
         return;
@@ -37,6 +53,11 @@ void CodeBuffer::patchLine(int lineNo, const std::string& newLine) {
     m_lines[idx] = newLine;
 }
 
+/*
+ * str():
+ *  Join all instruction lines with '\n'. The caller is responsible for any extra header
+ *  lines that must precede the assembly (the parser prints the linker header separately).
+ */
 std::string CodeBuffer::str() const {
     std::string out;
     out.reserve(m_lines.size() * 16);

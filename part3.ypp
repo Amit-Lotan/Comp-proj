@@ -1,6 +1,6 @@
 /*
  * EE046266 – Compilation Methods (Winter 2025–2026)
- * Project Part 3 – C-- → Riski compiler (rx-cc)
+ * Project Part 3 – C-- to Riski compiler (rx-cc)
  *
  * This file is the Bison parser + code generator.
  *
@@ -10,7 +10,7 @@
  *  3) Emit Riski assembly to CodeBuffer, using backpatching for control-flow.
  *  4) Emit a 4-line linker header (<header> / <unimplemented> / <implemented> / </header>).
  *
- * Key implementation notes for “strangers”:
+ * Key implementation notes:
  *  - No global variables: each function has its own symbol table.
  *  - Static (lexical) scoping: inner blocks can shadow outer vars.
  *  - We generate code as we parse (single pass), using backpatch lists.
@@ -51,8 +51,8 @@ void yyerror(const char* s);
 /*
  * VarBinding:
  *  A variable is represented by (Type, offset) where offset is in bytes relative to FP (I1).
- *  - Locals are stored at positive offsets: FP+8, FP+12, ...
- *  - Parameters are stored at negative offsets, because FP points to the *end* of the args area.
+ *  - Locals are stored at positive offsets: FP+8, FP+12, ... (and so on)
+ *  - Parameters are stored at negative offsets, because FP points to the end of the args area.
  */
 struct VarBinding {
     Type type;
@@ -98,9 +98,9 @@ static std::unordered_map<string, vector<VarBinding>> g_vars;
 static vector<std::unordered_set<string>> g_scopes;
 
 /*
- * Per-function parsing/codegen context:
- *  - g_blockDepth tracks nested blocks; at depth 1 we insert function params into the symbol table.
- *  - g_currentReturnJumps is a list of UJUMP placeholders emitted for return statements;
+ * Per-function parsing:
+ *  - g_blockDepth tracks nested blocks. at depth 1 we insert function params into the symbol table.
+ *  - g_currentReturnJumps is a list of UJUMP placeholders emitted for return statements.
  *    they get patched to the unified function epilogue.
  */
 static int g_blockDepth = 0;
@@ -114,7 +114,7 @@ static vector<int> g_currentReturnJumps;
 
 /*
  * Temporary register allocation:
- *  We keep "reserved" low registers for calling convention / stack mgmt:
+ *  We keep "reserved" low registers for calling convention:
  *     I0 = return address (architectural)
  *     I1 = FP (frame pointer)
  *     I2 = SP (stack pointer)
@@ -128,9 +128,9 @@ static constexpr int INT_TMP_BASE   = 11;
 static constexpr int FLOAT_TMP_BASE = 10;
 
 /*
- * IMPORTANT: Riski has strict typing between int and float operands.
+ * Riski has strict typing between int and float operands.
  * LOADF/STORF expect a FLOAT register as the base operand (B in Mem[B+C]).
- * Our stack pointers/FP are INT regs; therefore we convert I-base to float in F0.
+ * Our stack pointers/FP are INT regs. therefore we convert I-base to float in F0.
  */
 static constexpr int F_ADDR_SCRATCH = 0;
 
@@ -150,12 +150,10 @@ static int g_nextFloatReg = FLOAT_TMP_BASE;
 static int g_nextLocalOffset = 8;
 static int g_localAllocInstrLine = -1;
 
-// -------------------- Error helpers (canonical messages) --------------------
+// -------------------- Error helpers --------------------
 
 /*
  * The project requires printing to stderr and exiting with specific codes.
- * For semantic errors, the PDF says the description is free-form; however the provided
- * automated tests expect specific canonical phrases, so we use fixed strings below.
  */
 [[noreturn]] static void semanticErrorFixed(const char* msg) {
     cerr << "Semantic error: " << msg << " in line number " << yylineno << endl;
@@ -167,7 +165,6 @@ static int g_localAllocInstrLine = -1;
     std::exit(OPERATIONAL_ERROR);
 }
 
-// Canonical semantic messages expected by the tests:
 static constexpr const char* SEM_DUP_PARAM_NAME   = "Duplicate parameter name";
 static constexpr const char* SEM_UNDECL_VAR       = "Undeclared variable";
 static constexpr const char* SEM_VAR_REDECL       = "Variable already declared";
@@ -178,7 +175,6 @@ static constexpr const char* SEM_PARAM_TWICE      = "Parameter passed twice";
 static constexpr const char* SEM_MUST_RET_VALUE   = "Must return value from non-void function";
 static constexpr const char* SEM_CANT_RET_VALUE   = "Cannot return value from void function";
 
-// Additional semantic errors not explicitly checked by “message-format” tests:
 static constexpr const char* SEM_TYPE_MISMATCH    = "Type mismatch";
 static constexpr const char* SEM_ILLEGAL_VOID     = "Illegal use of void";
 static constexpr const char* SEM_UNDECL_FUNC      = "Undeclared function";
@@ -193,7 +189,7 @@ static inline string Freg(int r) { return "F" + std::to_string(r); }
 static inline string Faddr() { return Freg(F_ADDR_SCRATCH); }
 
 /*
- * Convert integer address register → float address register in F0.
+ * Convert integer address register to float address register in F0.
  * This is necessary because Riski enforces register-file types per opcode suffix:
  *  - LOADI/STORI: base in I
  *  - LOADF/STORF: base in F
@@ -202,13 +198,13 @@ static inline void addrToF0FromI(const string& ibase) {
     g_code.emit("CITOF " + Faddr() + " " + ibase);
 }
 
-/* Reset temporary allocation between statements / control conditions. */
+/* Reset temporary allocation between statements and control conditions. */
 static inline void resetTemps() {
     g_nextIntReg = INT_TMP_BASE;
     g_nextFloatReg = FLOAT_TMP_BASE;
 }
 
-/* Allocate a fresh temp register index in the corresponding register file. */
+/* Allocate a temp register index in the corresponding register file. */
 static inline int allocIntReg()   { return g_nextIntReg++; }
 static inline int allocFloatReg() { return g_nextFloatReg++; }
 
@@ -220,7 +216,7 @@ static inline bool sameSignature(const FunctionInfo& a, const FunctionInfo& b) {
 }
 
 /*
- * Variable lookup obeying static scoping:
+ * Variable lookup according to static scoping:
  *  - If a name is unknown in the current function, it is a semantic error.
  */
 static VarBinding lookupVar(const string& name) {
@@ -245,7 +241,7 @@ static void pushScope() {
 static void popScope() {
     if (g_scopes.empty()) return;
 
-    /* Remove bindings introduced in the current scope (supports shadowing). */
+    /* Remove bindings introduced in the current scope. */
     for (const auto& name : g_scopes.back()) {
         auto it = g_vars.find(name);
         if (it != g_vars.end() && !it->second.empty()) {
@@ -276,7 +272,7 @@ static void declareLocal(const string& name, Type t) {
 }
 
 /*
- * Insert function parameters into the *outermost* function block scope.
+ * Insert function parameters into the outermost function block scope.
  * Convention:
  *   FP (I1) points to end-of-args area.
  *   With n params, param i is stored at:
@@ -303,7 +299,7 @@ static void insertParamsIntoCurrentScope() {
  * - Enforces: no overloading (same name must have identical API).
  * - Tracks whether the function is defined in this file.
  * - Does NOT enforce any special signature for "main":
- *   the PDF explicitly says wrong main signature is runtime-undefined, not a compile error.
+ *   wrong main signature is runtime-undefined, not a compile error.
  */
 static void declareFunction(const string& name, Type retType,
                             const vector<Type>& paramTypes,
@@ -372,7 +368,7 @@ static void beginFunction(const string& name) {
     g_currentParamTypes = it->second.paramTypes;
     g_currentParamNames = it->second.paramNames;
 
-    /* New function ⇒ new variable environment. */
+    /* New function to new variable environment. */
     g_vars.clear();
     g_scopes.clear();
     g_blockDepth = 0;
@@ -525,7 +521,7 @@ FDEFS
     | /* empty */ { $$ = new Attr(); }
     ;
 
-/* Function declaration (prototype) ends with ';'. */
+/* Function declaration ends with ';'. */
 FUNC_DEC_API
     : TYPE TK_ID '(' ')' ';'
         { declareFunction($2->str, $1->type, {}, {}, false); $$ = new Attr(); }
@@ -549,7 +545,7 @@ TYPE
 
 /*
  * FUNC_ARGLIST builds ordered param lists.
- * Note: The grammar allows grouped declarations like a,b:int, which we expand
+ * The grammar allows grouped declarations like a,b:int, which we expand
  * into two parameters with the same type.
  */
 FUNC_ARGLIST
@@ -727,8 +723,8 @@ WRITE
  * RETURN:
  *  - If returning a value, it must match the function return type.
  *  - We copy the return value to I3/F3 and jump to the function epilogue.
- *  - If there is no explicit return at the end of a non-void function, the PDF says
- *    we still must return; the value is undefined. Therefore endFunction always emits RETRN.
+ *  - If there is no explicit return at the end of a non-void function,
+ *    we still must return, the value is undefined. Therefore endFunction always emits RETRN.
  */
 RETURN
     : TK_RETURN EXP ';'
@@ -761,7 +757,7 @@ IF_COND
 
 /*
  * Control statements:
- *  - if/then[/else] uses trueList/falseList backpatching.
+ *  - if/then/else uses trueList/falseList backpatching.
  *  - while uses a loop-start marker + condition lists.
  */
 CNTRL
@@ -970,7 +966,7 @@ EXP
         }
     ;
 
-/* Numeric literals: emit COPYI/COPYF into a fresh temp. */
+/* Numeric literals: emit COPYI/COPYF into a temp. */
 NUM
     : TK_INTEGERNUM
         {
@@ -997,9 +993,9 @@ NUM
  *   - argument count and types must match
  *   - named args map by parameter name, and cannot be duplicated
  *
- *  Codegen (calling convention):
+ *  Calling convention:
  *   1) Save currently-used temp registers on stack (caller-saves).
- *   2) Push arguments to stack in *parameter order* (after mapping).
+ *   2) Push arguments to stack in parameter order (after mapping).
  *   3) JLINK to callee label (patched if unknown yet).
  *   4) Pop args, restore temps, and copy return value from I3/F3 if non-void.
  */
@@ -1072,7 +1068,7 @@ CALL
                 g_code.emit("ADD2I I2 I2 " + std::to_string(saveSize));
             }
 
-            // Push args (store at offsets, bump SP once)
+            // Push args (store at offsets, update SP once)
             if (argSize > 0) {
                 bool needFloatBase = false;
                 for (int i = 0; i < nparams; ++i) {
@@ -1231,7 +1227,7 @@ int main(int argc, char** argv) {
 
     /*
      * Any call sites still unresolved by end-of-file point to a function implemented
-     * in another module. The linker will patch these; we write a placeholder target (0).
+     * in another module. The linker will patch these. we write a placeholder target (0).
      */
     for (auto& kv : g_functions) {
         FunctionInfo& info = kv.second;
@@ -1252,7 +1248,7 @@ int main(int argc, char** argv) {
      *  <implemented>   func,L   func2,L...
      *  </header>
      *
-     * NOTE: All line numbers refer to the code *after* </header>, starting from 1.
+     * All line numbers refer to the code *after* </header>, starting from 1.
      */
     string unimpl = "<unimplemented>";
     string impl   = "<implemented>";

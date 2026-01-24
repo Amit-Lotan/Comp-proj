@@ -1,3 +1,24 @@
+/*
+ * EE046266 – Compilation Methods (Winter 2025–2026)
+ * Project Part 3 – C-- → Riski compiler (rx-cc)
+ *
+ * This file is the Bison parser + code generator.
+ *
+ * High-level responsibilities:
+ *  1) Parse C-- according to the project grammar.
+ *  2) Enforce semantic rules (types, scoping, function API, named arguments).
+ *  3) Emit Riski assembly to CodeBuffer, using backpatching for control-flow.
+ *  4) Emit a 4-line linker header (<header> / <unimplemented> / <implemented> / </header>).
+ *
+ * Key implementation notes for “strangers”:
+ *  - No global variables: each function has its own symbol table.
+ *  - Static (lexical) scoping: inner blocks can shadow outer vars.
+ *  - We generate code as we parse (single pass), using backpatch lists.
+ *  - Calling convention is caller-saves: all temp registers may be clobbered by a call.
+ *  - Riski has separate int and float register files. LOADF/STORF require a float base
+ *    register; therefore we convert integer address registers (FP/SP) via CITOF into F0.
+ */
+
 %{
 #include <cstdio>
 #include <cstdlib>
@@ -27,11 +48,25 @@ void yyerror(const char* s);
 
 // -------------------- Global compiler state --------------------
 
+/*
+ * VarBinding:
+ *  A variable is represented by (Type, offset) where offset is in bytes relative to FP (I1).
+ *  - Locals are stored at positive offsets: FP+8, FP+12, ...
+ *  - Parameters are stored at negative offsets, because FP points to the *end* of the args area.
+ */
 struct VarBinding {
     Type type;
     int offset; // bytes relative to FP
 };
 
+/*
+ * FunctionInfo:
+ *  Stored in g_functions for all declared/defined functions in this compilation unit.
+ *  We keep:
+ *   - return type + ordered parameter types + ordered parameter names
+ *   - whether it is defined in THIS file, and if so its start line in the generated code
+ *   - all call sites (for header output), and unresolved call sites (for backpatching)
+ */
 struct FunctionInfo {
     Type returnType = void_t;
     vector<Type> paramTypes;
@@ -44,12 +79,30 @@ struct FunctionInfo {
     vector<int> unresolvedCallLines;
 };
 
+/*
+ * g_code:
+ *  The assembly we generate (Riski). Line numbers are 1-based as required by the VM/linker.
+ *
+ * g_functions:
+ *  Function symbol table for this file, used both for semantic checks and for linker header.
+ */
 static CodeBuffer g_code;
 static std::map<string, FunctionInfo> g_functions;
 
+/*
+ * Variable symbol table with static scoping:
+ *  - g_scopes is a stack of scope-frames; each frame holds variable names declared in that scope.
+ *  - g_vars maps name -> stack of bindings (to support shadowing). The top binding is the visible one.
+ */
 static std::unordered_map<string, vector<VarBinding>> g_vars;
 static vector<std::unordered_set<string>> g_scopes;
 
+/*
+ * Per-function parsing/codegen context:
+ *  - g_blockDepth tracks nested blocks; at depth 1 we insert function params into the symbol table.
+ *  - g_currentReturnJumps is a list of UJUMP placeholders emitted for return statements;
+ *    they get patched to the unified function epilogue.
+ */
 static int g_blockDepth = 0;
 static bool g_paramsInserted = false;
 
@@ -59,20 +112,51 @@ static vector<Type> g_currentParamTypes;
 static vector<string> g_currentParamNames;
 static vector<int> g_currentReturnJumps;
 
+/*
+ * Temporary register allocation:
+ *  We keep "reserved" low registers for calling convention / stack mgmt:
+ *     I0 = return address (architectural)
+ *     I1 = FP (frame pointer)
+ *     I2 = SP (stack pointer)
+ *     I3 / F3 = function return value (our convention)
+ *     I4 = scratch (old FP / base for restore)
+ *
+ * Temps are allocated from INT_TMP_BASE / FLOAT_TMP_BASE upward.
+ * We reset allocation between statements to keep temp usage bounded.
+ */
 static constexpr int INT_TMP_BASE   = 11;
 static constexpr int FLOAT_TMP_BASE = 10;
 
-// Reserve F0 as "address scratch" for LOADF/STORF base conversion.
+/*
+ * IMPORTANT: Riski has strict typing between int and float operands.
+ * LOADF/STORF expect a FLOAT register as the base operand (B in Mem[B+C]).
+ * Our stack pointers/FP are INT regs; therefore we convert I-base to float in F0.
+ */
 static constexpr int F_ADDR_SCRATCH = 0;
 
 static int g_nextIntReg   = INT_TMP_BASE;
 static int g_nextFloatReg = FLOAT_TMP_BASE;
 
+/*
+ * Stack-frame layout:
+ *  We allocate a fixed 8-byte header at function entry:
+ *    [FP + 0] old FP
+ *    [FP + 4] saved return address (I0)
+ *  Locals start at [FP + 8] and grow upward by 4 bytes each.
+ *
+ * g_nextLocalOffset tracks the next free local slot.
+ * g_localAllocInstrLine is the line of "ADD2I I2 I2 <frameSize>" that we backpatch later.
+ */
 static int g_nextLocalOffset = 8;
 static int g_localAllocInstrLine = -1;
 
 // -------------------- Error helpers (canonical messages) --------------------
 
+/*
+ * The project requires printing to stderr and exiting with specific codes.
+ * For semantic errors, the PDF says the description is free-form; however the provided
+ * automated tests expect specific canonical phrases, so we use fixed strings below.
+ */
 [[noreturn]] static void semanticErrorFixed(const char* msg) {
     cerr << "Semantic error: " << msg << " in line number " << yylineno << endl;
     std::exit(SEMANTIC_ERROR);
@@ -83,7 +167,7 @@ static int g_localAllocInstrLine = -1;
     std::exit(OPERATIONAL_ERROR);
 }
 
-// Canonical semantic messages expected by your tests:
+// Canonical semantic messages expected by the tests:
 static constexpr const char* SEM_DUP_PARAM_NAME   = "Duplicate parameter name";
 static constexpr const char* SEM_UNDECL_VAR       = "Undeclared variable";
 static constexpr const char* SEM_VAR_REDECL       = "Variable already declared";
@@ -94,36 +178,51 @@ static constexpr const char* SEM_PARAM_TWICE      = "Parameter passed twice";
 static constexpr const char* SEM_MUST_RET_VALUE   = "Must return value from non-void function";
 static constexpr const char* SEM_CANT_RET_VALUE   = "Cannot return value from void function";
 
-// For other semantic errors not covered by your message-tests:
+// Additional semantic errors not explicitly checked by “message-format” tests:
 static constexpr const char* SEM_TYPE_MISMATCH    = "Type mismatch";
 static constexpr const char* SEM_ILLEGAL_VOID     = "Illegal use of void";
 static constexpr const char* SEM_UNDECL_FUNC      = "Undeclared function";
 
 // -------------------- Small utilities --------------------
 
+/* Convert register numbers to Riski register strings. */
 static inline string Ireg(int r) { return "I" + std::to_string(r); }
 static inline string Freg(int r) { return "F" + std::to_string(r); }
 
+/* Address scratch register (float) used as base for LOADF/STORF. */
 static inline string Faddr() { return Freg(F_ADDR_SCRATCH); }
 
+/*
+ * Convert integer address register → float address register in F0.
+ * This is necessary because Riski enforces register-file types per opcode suffix:
+ *  - LOADI/STORI: base in I
+ *  - LOADF/STORF: base in F
+ */
 static inline void addrToF0FromI(const string& ibase) {
     g_code.emit("CITOF " + Faddr() + " " + ibase);
 }
 
+/* Reset temporary allocation between statements / control conditions. */
 static inline void resetTemps() {
     g_nextIntReg = INT_TMP_BASE;
     g_nextFloatReg = FLOAT_TMP_BASE;
 }
 
+/* Allocate a fresh temp register index in the corresponding register file. */
 static inline int allocIntReg()   { return g_nextIntReg++; }
 static inline int allocFloatReg() { return g_nextFloatReg++; }
 
+/* Utility to compare function APIs (no overloading allowed). */
 static inline bool sameSignature(const FunctionInfo& a, const FunctionInfo& b) {
     return a.returnType == b.returnType &&
            a.paramTypes == b.paramTypes &&
            a.paramNames == b.paramNames;
 }
 
+/*
+ * Variable lookup obeying static scoping:
+ *  - If a name is unknown in the current function, it is a semantic error.
+ */
 static VarBinding lookupVar(const string& name) {
     auto it = g_vars.find(name);
     if (it == g_vars.end() || it->second.empty()) {
@@ -132,17 +231,21 @@ static VarBinding lookupVar(const string& name) {
     return it->second.back();
 }
 
+/* Check whether 'name' was already declared in the current (innermost) scope. */
 static bool declaredInCurrentScope(const string& name) {
     if (g_scopes.empty()) return false;
     return g_scopes.back().find(name) != g_scopes.back().end();
 }
 
+/* Scope management: push/pop a lexical scope (BLK). */
 static void pushScope() {
     g_scopes.emplace_back();
 }
 
 static void popScope() {
     if (g_scopes.empty()) return;
+
+    /* Remove bindings introduced in the current scope (supports shadowing). */
     for (const auto& name : g_scopes.back()) {
         auto it = g_vars.find(name);
         if (it != g_vars.end() && !it->second.empty()) {
@@ -153,6 +256,10 @@ static void popScope() {
     g_scopes.pop_back();
 }
 
+/*
+ * Declare a variable in the current scope with a precomputed FP-relative offset.
+ * Used for locals and for parameters (params have negative offsets).
+ */
 static void declareVarWithOffset(const string& name, Type t, int offset) {
     if (t == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
     if (declaredInCurrentScope(name)) semanticErrorFixed(SEM_VAR_REDECL);
@@ -161,12 +268,20 @@ static void declareVarWithOffset(const string& name, Type t, int offset) {
     g_vars[name].push_back(VarBinding{t, offset});
 }
 
+/* Allocate one 4-byte local slot at FP+g_nextLocalOffset. */
 static void declareLocal(const string& name, Type t) {
     const int offset = g_nextLocalOffset;
     g_nextLocalOffset += 4;
     declareVarWithOffset(name, t, offset);
 }
 
+/*
+ * Insert function parameters into the *outermost* function block scope.
+ * Convention:
+ *   FP (I1) points to end-of-args area.
+ *   With n params, param i is stored at:
+ *     offset = -4*(n - i)
+ */
 static void insertParamsIntoCurrentScope() {
     if (g_paramsInserted) return;
 
@@ -177,14 +292,19 @@ static void insertParamsIntoCurrentScope() {
 
         if (ptype == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
 
-        // FP points to end-of-args:
-        // param[i] offset = -4*(n - i)
         const int offset = -4 * (n - i);
         declareVarWithOffset(pname, ptype, offset);
     }
     g_paramsInserted = true;
 }
 
+/*
+ * Declare or define a function signature.
+ * - Enforces: no overloading (same name must have identical API).
+ * - Tracks whether the function is defined in this file.
+ * - Does NOT enforce any special signature for "main":
+ *   the PDF explicitly says wrong main signature is runtime-undefined, not a compile error.
+ */
 static void declareFunction(const string& name, Type retType,
                             const vector<Type>& paramTypes,
                             const vector<string>& paramNames,
@@ -198,6 +318,7 @@ static void declareFunction(const string& name, Type retType,
         semanticErrorFixed(SEM_FUNC_REDEF);
     }
 
+    /* Validate parameter names are unique and types are not void. */
     {
         std::unordered_set<string> seen;
         for (size_t i = 0; i < sig.paramNames.size(); ++i) {
@@ -210,10 +331,6 @@ static void declareFunction(const string& name, Type retType,
         }
     }
 
-    // IMPORTANT: Do NOT enforce any special signature for main here.
-    // The PDF says different main API leads to undefined behavior at runtime,
-    // not a compiler semantic error. :contentReference[oaicite:2]{index=2}
-
     auto it = g_functions.find(name);
     if (it == g_functions.end()) {
         FunctionInfo info = sig;
@@ -222,6 +339,7 @@ static void declareFunction(const string& name, Type retType,
         g_functions.emplace(name, std::move(info));
         it = g_functions.find(name);
     } else {
+        /* Function already seen: require identical signature and no redefinition. */
         FunctionInfo existingSig = it->second;
         existingSig.isDefined = false;
         existingSig.startLineImplementation = 0;
@@ -239,6 +357,12 @@ static void declareFunction(const string& name, Type retType,
     if (isDefinition) it->second.isDefined = true;
 }
 
+/*
+ * Begin emitting a function body:
+ *  - sets current-function context and resets per-function symbol tables
+ *  - patches calls to this function that appeared earlier in the file
+ *  - emits prologue and a placeholder for allocating locals (patched in endFunction)
+ */
 static void beginFunction(const string& name) {
     auto it = g_functions.find(name);
     if (it == g_functions.end()) semanticErrorFixed(SEM_FUNC_REDEF);
@@ -248,6 +372,7 @@ static void beginFunction(const string& name) {
     g_currentParamTypes = it->second.paramTypes;
     g_currentParamNames = it->second.paramNames;
 
+    /* New function ⇒ new variable environment. */
     g_vars.clear();
     g_scopes.clear();
     g_blockDepth = 0;
@@ -258,25 +383,38 @@ static void beginFunction(const string& name) {
     g_localAllocInstrLine = -1;
     g_currentReturnJumps.clear();
 
+    /* Function "label" is the next emitted instruction line. */
     const int startLine = g_code.nextQuad();
     it->second.startLineImplementation = startLine;
 
+    /* If we had calls before the definition, patch them now. */
     if (!it->second.unresolvedCallLines.empty()) {
         g_code.backpatch(it->second.unresolvedCallLines, startLine);
         it->second.unresolvedCallLines.clear();
     }
 
-    // Prologue (same as previous baseline)
+    /*
+     * Prologue:
+     *  I4 = old FP
+     *  FP = SP (end-of-args)
+     *  Save old FP and return address in frame header
+     */
     g_code.emit("COPYI I4 I1");    // I4 = old FP
     g_code.emit("COPYI I1 I2");    // FP = SP (end-of-args)
     g_code.emit("STORI I4 I1 0");  // save old FP
     g_code.emit("STORI I0 I1 4");  // save return address
 
-    // allocate header+locals (patched later)
+    /* Allocate header+locals (patched later with exact frame size). */
     g_localAllocInstrLine = g_code.nextQuad();
     g_code.emit("ADD2I I2 I2 ");
 }
 
+/*
+ * End emitting a function body:
+ *  - patch frame size allocation
+ *  - patch all pending returns to the unified epilogue
+ *  - emit epilogue and RETRN
+ */
 static void endFunction(const vector<int>& blkNextList) {
     const int frameSize = g_nextLocalOffset;
     g_code.backpatch(vector<int>{g_localAllocInstrLine}, frameSize);
@@ -285,12 +423,14 @@ static void endFunction(const vector<int>& blkNextList) {
     g_code.backpatch(g_currentReturnJumps, epilogueStart);
     g_code.backpatch(blkNextList, epilogueStart);
 
+    /* Epilogue: restore FP and return address, reset SP, and return. */
     g_code.emit("LOADI I4 I1 0");
     g_code.emit("LOADI I0 I1 4");
     g_code.emit("COPYI I2 I1");
     g_code.emit("COPYI I1 I4");
     g_code.emit("RETRN");
 
+    /* Clear current-function context. */
     g_currentFunc.clear();
     g_currentReturnType = void_t;
     g_currentParamTypes.clear();
@@ -301,6 +441,10 @@ static void endFunction(const vector<int>& blkNextList) {
     resetTemps();
 }
 
+/*
+ * Emit PRNTC sequence for a string literal, handling escape sequences:
+ *   \n, \t, \", \\
+ */
 static void emitPrintString(const string& s) {
     for (size_t i = 0; i < s.size(); ++i) {
         unsigned char ch = static_cast<unsigned char>(s[i]);
@@ -364,16 +508,24 @@ static void emitPrintString(const string& s) {
 
 %%
 
+/* PROGRAM ::= sequence of function declarations/definitions (possibly empty). */
 PROGRAM
     : FDEFS
     ;
 
+/*
+ * FDEFS:
+ *  We allow declarations and definitions in any order.
+ *  For definitions, we call beginFunction() right after parsing the signature,
+ *  then parse the BLK and close with endFunction().
+ */
 FDEFS
     : FDEFS FUNC_DEC_API
     | FDEFS FUNC_DEF_API { beginFunction($2->str); } BLK { endFunction($4->nextList); }
     | /* empty */ { $$ = new Attr(); }
     ;
 
+/* Function declaration (prototype) ends with ';'. */
 FUNC_DEC_API
     : TYPE TK_ID '(' ')' ';'
         { declareFunction($2->str, $1->type, {}, {}, false); $$ = new Attr(); }
@@ -381,6 +533,7 @@ FUNC_DEC_API
         { declareFunction($2->str, $1->type, $4->paramTypes, $4->paramNames, false); $$ = new Attr(); }
     ;
 
+/* Function definition signature (body comes after this rule). */
 FUNC_DEF_API
     : TYPE TK_ID '(' ')'
         { declareFunction($2->str, $1->type, {}, {}, true); $$ = new Attr(); $$->str = $2->str; }
@@ -394,6 +547,11 @@ TYPE
     | TK_VOID  { $$ = new Attr(); $$->type = void_t; }
     ;
 
+/*
+ * FUNC_ARGLIST builds ordered param lists.
+ * Note: The grammar allows grouped declarations like a,b:int, which we expand
+ * into two parameters with the same type.
+ */
 FUNC_ARGLIST
     : FUNC_ARGLIST ',' DCL
         {
@@ -413,6 +571,7 @@ FUNC_ARGLIST
         }
     ;
 
+/* DCL supports grouped identifiers: x,y,z:int */
 DCL
     : TK_ID ':' TYPE
         { $$ = new Attr(); $$->type = $3->type; $$->names.push_back($1->str); }
@@ -420,6 +579,11 @@ DCL
         { $$ = $3; $$->names.insert($$->names.begin(), $1->str); }
     ;
 
+/*
+ * BLK:
+ *  Push a new scope when entering '{', pop it at '}'.
+ *  The first (outermost) block of a function also gets the parameters inserted.
+ */
 BLK
     : '{' BLK_BEGIN STLIST '}' BLK_END { $$ = $3; }
     ;
@@ -443,6 +607,13 @@ BLK_END
         }
     ;
 
+/*
+ * STLIST:
+ *  Classic backpatch pattern:
+ *   - each statement may leave a "nextList" of pending jumps
+ *   - marker M captures the next instruction line
+ *   - previous nextList is backpatched to M.quad
+ */
 STLIST
     : STLIST M STMT
         {
@@ -453,10 +624,12 @@ STLIST
     | /* empty */ { $$ = new Attr(); }
     ;
 
+/* Marker M: records nextQuad for control-flow backpatching. */
 M
     : /* empty */ { $$ = new Attr(); $$->quad = g_code.nextQuad(); }
     ;
 
+/* Marker N: emits an unconditional jump placeholder and returns it as nextList. */
 N
     : /* empty */
         {
@@ -466,6 +639,11 @@ N
         }
     ;
 
+/*
+ * STMT:
+ *  Most statements reset temps afterward: since our register allocation is simple,
+ *  this keeps temp usage bounded and makes calls safe with our caller-saves approach.
+ */
 STMT
     : DCL ';'
         {
@@ -487,6 +665,7 @@ STMT
     | BLK { $$ = $1; resetTemps(); }
     ;
 
+/* Assignment: types must match; store according to type using FP-relative offset. */
 ASSN
     : LVAL TK_ASSIGN EXP ';'
         {
@@ -496,6 +675,7 @@ ASSN
             if ($1->type == int_) {
                 g_code.emit("STORI " + Ireg($3->reg) + " I1 " + std::to_string($1->offset));
             } else {
+                /* Float memory base must be float-register (convert FP to F0). */
                 addrToF0FromI("I1");
                 g_code.emit("STORF " + Freg($3->reg) + " " + Faddr() + " " + std::to_string($1->offset));
             }
@@ -543,6 +723,13 @@ WRITE
         { emitPrintString($3->str); $$ = new Attr(); }
     ;
 
+/*
+ * RETURN:
+ *  - If returning a value, it must match the function return type.
+ *  - We copy the return value to I3/F3 and jump to the function epilogue.
+ *  - If there is no explicit return at the end of a non-void function, the PDF says
+ *    we still must return; the value is undefined. Therefore endFunction always emits RETRN.
+ */
 RETURN
     : TK_RETURN EXP ';'
         {
@@ -567,10 +754,16 @@ RETURN
         }
     ;
 
+/* IF_COND is a small helper so we can reset temps after evaluating the boolean. */
 IF_COND
     : TK_IF BEXP { resetTemps(); $$ = $2; }
     ;
 
+/*
+ * Control statements:
+ *  - if/then[/else] uses trueList/falseList backpatching.
+ *  - while uses a loop-start marker + condition lists.
+ */
 CNTRL
     : IF_COND TK_THEN M STMT TK_ELSE N M STMT
         {
@@ -596,6 +789,11 @@ CNTRL
         }
     ;
 
+/*
+ * Boolean expressions:
+ *  - OR/AND are short-circuit using backpatching.
+ *  - Relational expression produces (trueList,falseList) using conditional branch.
+ */
 BEXP
     : BEXP TK_OR M BEXP
         {
@@ -621,6 +819,10 @@ BEXP
             const string& op = $2->str;
             int condI = -1;
 
+            /*
+             * We compute a 0/1 condition result, then branch on it.
+             * For floats: compare in float regs, then convert to int via CFTOI.
+             */
             if ($1->type == int_) {
                 condI = allocIntReg();
                 if (op == "==")      g_code.emit("SEQUI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
@@ -644,6 +846,7 @@ BEXP
                 g_code.emit("CFTOI " + Ireg(condI) + " " + Freg(condF));
             }
 
+            /* For <= and >= we computed the opposite comparison, so "true" means cond==0. */
             const bool trueOnZero = (op == "<=" || op == ">=");
 
             $$ = new Attr();
@@ -660,6 +863,12 @@ BEXP
         { $$ = $2; }
     ;
 
+/*
+ * Arithmetic/primary expressions:
+ *  - Require matching types (unless explicit cast is used).
+ *  - Variables load from memory (FP-relative).
+ *  - Cast between int/float uses CITOF/CFTOI.
+ */
 EXP
     : EXP TK_ADDOP EXP
         {
@@ -761,6 +970,7 @@ EXP
         }
     ;
 
+/* Numeric literals: emit COPYI/COPYF into a fresh temp. */
 NUM
     : TK_INTEGERNUM
         {
@@ -780,6 +990,19 @@ NUM
         }
     ;
 
+/*
+ * CALL:
+ *  Semantic checks:
+ *   - function must be declared before use (in this file)
+ *   - argument count and types must match
+ *   - named args map by parameter name, and cannot be duplicated
+ *
+ *  Codegen (calling convention):
+ *   1) Save currently-used temp registers on stack (caller-saves).
+ *   2) Push arguments to stack in *parameter order* (after mapping).
+ *   3) JLINK to callee label (patched if unknown yet).
+ *   4) Pop args, restore temps, and copy return value from I3/F3 if non-void.
+ */
 CALL
     : TK_ID '(' CALL_ARGS ')'
         {
@@ -797,12 +1020,14 @@ CALL
             vector<Type> argTypes(static_cast<size_t>(nparams), void_t);
             vector<int>  argRegs(static_cast<size_t>(nparams), -1);
 
+            /* First fill positional arguments in order. */
             for (int i = 0; i < npos; ++i) {
                 provided[i] = true;
                 argTypes[i] = $3->posTypes[i];
                 argRegs[i]  = $3->posRegs[i];
             }
 
+            /* Then process named arguments (must not collide with earlier ones). */
             for (size_t j = 0; j < $3->namedNames.size(); ++j) {
                 const string& label = $3->namedNames[j];
 
@@ -819,6 +1044,7 @@ CALL
                 argRegs[idx]  = $3->namedRegs[j];
             }
 
+            /* Ensure all parameters are provided and types match. */
             for (int i = 0; i < nparams; ++i) {
                 if (!provided[i]) semanticErrorFixed(SEM_WRONG_NUM_ARGS);
                 if (argTypes[i] != finfo.paramTypes[i]) semanticErrorFixed(SEM_TYPE_MISMATCH);
@@ -911,6 +1137,14 @@ CALL
         }
     ;
 
+/*
+ * CALL_ARGS:
+ *  Grammar enforces "positional first, named after" by only allowing:
+ *    - empty
+ *    - POS_ARGLIST
+ *    - NAMED_ARGLIST
+ *    - POS_ARGLIST ',' NAMED_ARGLIST
+ */
 CALL_ARGS
     : /* empty */ { $$ = new Attr(); }
     | POS_ARGLIST { $$ = $1; }
@@ -944,9 +1178,12 @@ NAMED_ARGLIST
         }
     ;
 
-/* IMPORTANT FIX:
-   Named args are parsed as label:value (ID ':' EXP)
-   so calls like pack(y:2, x:1) work as expected. */
+/*
+ * Named argument syntax in this implementation:
+ *   label : value
+ * Example:
+ *   f(b:2, a:1)
+ */
 NAMED_ARG
     : TK_ID ':' EXP
         {
@@ -959,12 +1196,19 @@ NAMED_ARG
 
 %%
 
+/*
+ * Syntax error handler:
+ *  The required message format is:
+ *    Syntax error: '<lexeme>' in line number <line>
+ *  where <lexeme> is the current token text (or "EOF").
+ */
 void yyerror(const char* /*s*/) {
     const string lexeme = (yytext != nullptr && yytext[0] != '\0') ? string(yytext) : string("EOF");
     cerr << "Syntax error: '" << lexeme << "' in line number " << yylineno << endl;
     std::exit(SYNTAX_ERROR);
 }
 
+/* Replace extension while preserving directory path (dir/a.cmm → dir/a.rsk). */
 static string replaceExtKeepPath(const string& path, const string& newExtWithDot) {
     const size_t slash = path.find_last_of("/\\");
     const size_t dot = path.find_last_of('.');
@@ -985,6 +1229,10 @@ int main(int argc, char** argv) {
 
     yyparse();
 
+    /*
+     * Any call sites still unresolved by end-of-file point to a function implemented
+     * in another module. The linker will patch these; we write a placeholder target (0).
+     */
     for (auto& kv : g_functions) {
         FunctionInfo& info = kv.second;
         if (!info.isDefined && !info.unresolvedCallLines.empty()) {
@@ -997,6 +1245,15 @@ int main(int argc, char** argv) {
     std::ofstream out(outputFile);
     if (!out) operationalError("cannot open output file for writing");
 
+    /*
+     * Linker header format:
+     *  <header>
+     *  <unimplemented> func,L1,L2... func2,L1...
+     *  <implemented>   func,L   func2,L...
+     *  </header>
+     *
+     * NOTE: All line numbers refer to the code *after* </header>, starting from 1.
+     */
     string unimpl = "<unimplemented>";
     string impl   = "<implemented>";
 

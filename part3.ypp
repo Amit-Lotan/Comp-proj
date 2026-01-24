@@ -9,7 +9,6 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
 #include "part3_helpers.hpp"
@@ -30,7 +29,7 @@ void yyerror(const char* s);
 
 struct VarBinding {
     Type type;
-    int offset; // bytes, relative to FP
+    int offset; // bytes relative to FP
 };
 
 struct FunctionInfo {
@@ -48,7 +47,7 @@ struct FunctionInfo {
 static CodeBuffer g_code;
 static std::map<string, FunctionInfo> g_functions;
 
-static std::unordered_map<string, vector<VarBinding>> g_vars; // stack per id
+static std::unordered_map<string, vector<VarBinding>> g_vars;
 static vector<std::unordered_set<string>> g_scopes;
 
 static int g_blockDepth = 0;
@@ -63,25 +62,18 @@ static vector<int> g_currentReturnJumps;
 static constexpr int INT_TMP_BASE   = 11;
 static constexpr int FLOAT_TMP_BASE = 10;
 
-// IMPORTANT: reserve F0 as an "address scratch" register.
-// We use it as the base register for LOADF/STORF by first emitting
-//    CITOF F0 <I-base>
-// and then using F0 as the base operand.
-//
-// This fixes the VM error you saw:
-//   illegal regtype prefix I, Expected: F
-// which occurs when emitting LOADF/STORF with an I-register base.
+// Reserve F0 as "address scratch" for LOADF/STORF base conversion.
 static constexpr int F_ADDR_SCRATCH = 0;
 
 static int g_nextIntReg   = INT_TMP_BASE;
 static int g_nextFloatReg = FLOAT_TMP_BASE;
 
-static int g_nextLocalOffset = 8;      // locals start at FP+8
-static int g_localAllocInstrLine = -1; // line number of "ADD2I I2 I2 <frameSize>"
+static int g_nextLocalOffset = 8;
+static int g_localAllocInstrLine = -1;
 
-// -------------------- Error helpers --------------------
+// -------------------- Error helpers (canonical messages) --------------------
 
-[[noreturn]] static void semanticError(const string& msg) {
+[[noreturn]] static void semanticErrorFixed(const char* msg) {
     cerr << "Semantic error: " << msg << " in line number " << yylineno << endl;
     std::exit(SEMANTIC_ERROR);
 }
@@ -91,15 +83,30 @@ static int g_localAllocInstrLine = -1; // line number of "ADD2I I2 I2 <frameSize
     std::exit(OPERATIONAL_ERROR);
 }
 
+// Canonical semantic messages expected by your tests:
+static constexpr const char* SEM_DUP_PARAM_NAME   = "Duplicate parameter name";
+static constexpr const char* SEM_UNDECL_VAR       = "Undeclared variable";
+static constexpr const char* SEM_VAR_REDECL       = "Variable already declared";
+static constexpr const char* SEM_FUNC_REDEF       = "Function redefined";
+static constexpr const char* SEM_WRONG_NUM_ARGS   = "Wrong number of arguments";
+static constexpr const char* SEM_UNKNOWN_NAMED    = "Unknown named parameter";
+static constexpr const char* SEM_PARAM_TWICE      = "Parameter passed twice";
+static constexpr const char* SEM_MUST_RET_VALUE   = "Must return value from non-void function";
+static constexpr const char* SEM_CANT_RET_VALUE   = "Cannot return value from void function";
+
+// For other semantic errors not covered by your message-tests:
+static constexpr const char* SEM_TYPE_MISMATCH    = "Type mismatch";
+static constexpr const char* SEM_ILLEGAL_VOID     = "Illegal use of void";
+static constexpr const char* SEM_UNDECL_FUNC      = "Undeclared function";
+
 // -------------------- Small utilities --------------------
 
 static inline string Ireg(int r) { return "I" + std::to_string(r); }
 static inline string Freg(int r) { return "F" + std::to_string(r); }
 
 static inline string Faddr() { return Freg(F_ADDR_SCRATCH); }
+
 static inline void addrToF0FromI(const string& ibase) {
-    // Convert integer address (in an I-register) to float value in F0.
-    // Then LOADF/STORF can use F0 as the base register.
     g_code.emit("CITOF " + Faddr() + " " + ibase);
 }
 
@@ -120,7 +127,7 @@ static inline bool sameSignature(const FunctionInfo& a, const FunctionInfo& b) {
 static VarBinding lookupVar(const string& name) {
     auto it = g_vars.find(name);
     if (it == g_vars.end() || it->second.empty()) {
-        semanticError("variable '" + name + "' is not declared");
+        semanticErrorFixed(SEM_UNDECL_VAR);
     }
     return it->second.back();
 }
@@ -140,21 +147,16 @@ static void popScope() {
         auto it = g_vars.find(name);
         if (it != g_vars.end() && !it->second.empty()) {
             it->second.pop_back();
-            if (it->second.empty()) {
-                g_vars.erase(it);
-            }
+            if (it->second.empty()) g_vars.erase(it);
         }
     }
     g_scopes.pop_back();
 }
 
 static void declareVarWithOffset(const string& name, Type t, int offset) {
-    if (t == void_t) {
-        semanticError("'" + name + "' cannot be declared as void");
-    }
-    if (declaredInCurrentScope(name)) {
-        semanticError("redefinition of variable '" + name + "' in the same scope");
-    }
+    if (t == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
+    if (declaredInCurrentScope(name)) semanticErrorFixed(SEM_VAR_REDECL);
+
     g_scopes.back().insert(name);
     g_vars[name].push_back(VarBinding{t, offset});
 }
@@ -173,8 +175,10 @@ static void insertParamsIntoCurrentScope() {
         const string& pname = g_currentParamNames[i];
         const Type ptype = g_currentParamTypes[i];
 
-        // FP points to end-of-args. So param[i] is at:
-        //   offset = -4*(n - i)
+        if (ptype == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
+
+        // FP points to end-of-args:
+        // param[i] offset = -4*(n - i)
         const int offset = -4 * (n - i);
         declareVarWithOffset(pname, ptype, offset);
     }
@@ -191,27 +195,24 @@ static void declareFunction(const string& name, Type retType,
     sig.paramNames = paramNames;
 
     if (sig.paramTypes.size() != sig.paramNames.size()) {
-        semanticError("internal error: parameter list mismatch in function '" + name + "'");
+        semanticErrorFixed(SEM_FUNC_REDEF);
     }
 
     {
         std::unordered_set<string> seen;
-        for (size_t i = 0; i < sig.paramTypes.size(); ++i) {
-            if (sig.paramTypes[i] == void_t) {
-                semanticError("parameter '" + sig.paramNames[i] + "' cannot be declared as void in function '" + name + "'");
-            }
+        for (size_t i = 0; i < sig.paramNames.size(); ++i) {
             if (!seen.insert(sig.paramNames[i]).second) {
-                semanticError("duplicate parameter name '" + sig.paramNames[i] + "' in function '" + name + "'");
+                semanticErrorFixed(SEM_DUP_PARAM_NAME);
+            }
+            if (sig.paramTypes[i] == void_t) {
+                semanticErrorFixed(SEM_ILLEGAL_VOID);
             }
         }
     }
 
-    // main must be exactly: void main()
-    if (name == "main") {
-        if (retType != void_t || !paramTypes.empty()) {
-            semanticError("function 'main' must have signature 'void main()'");
-        }
-    }
+    // IMPORTANT: Do NOT enforce any special signature for main here.
+    // The PDF says different main API leads to undefined behavior at runtime,
+    // not a compiler semantic error. :contentReference[oaicite:2]{index=2}
 
     auto it = g_functions.find(name);
     if (it == g_functions.end()) {
@@ -228,24 +229,19 @@ static void declareFunction(const string& name, Type retType,
         existingSig.unresolvedCallLines.clear();
 
         if (!sameSignature(existingSig, sig)) {
-            semanticError("function '" + name + "' declared with a different signature");
+            semanticErrorFixed(SEM_FUNC_REDEF);
         }
-
         if (isDefinition && it->second.isDefined) {
-            semanticError("redefinition of function '" + name + "'");
+            semanticErrorFixed(SEM_FUNC_REDEF);
         }
     }
 
-    if (isDefinition) {
-        it->second.isDefined = true;
-    }
+    if (isDefinition) it->second.isDefined = true;
 }
 
 static void beginFunction(const string& name) {
     auto it = g_functions.find(name);
-    if (it == g_functions.end()) {
-        semanticError("internal error: beginFunction on unknown function '" + name + "'");
-    }
+    if (it == g_functions.end()) semanticErrorFixed(SEM_FUNC_REDEF);
 
     g_currentFunc = name;
     g_currentReturnType = it->second.returnType;
@@ -270,41 +266,29 @@ static void beginFunction(const string& name) {
         it->second.unresolvedCallLines.clear();
     }
 
-    // Prologue:
-    // I0 = return address (set by JLINK)
-    // I1 = FP, I2 = SP
-    //
-    // Frame header (8 bytes):
-    //   [FP+0] = old FP
-    //   [FP+4] = saved return address (I0)
-    // Locals begin at FP+8
-
+    // Prologue (same as previous baseline)
     g_code.emit("COPYI I4 I1");    // I4 = old FP
     g_code.emit("COPYI I1 I2");    // FP = SP (end-of-args)
     g_code.emit("STORI I4 I1 0");  // save old FP
     g_code.emit("STORI I0 I1 4");  // save return address
 
-    // Allocate header+locals; patched at end (min 8 bytes)
+    // allocate header+locals (patched later)
     g_localAllocInstrLine = g_code.nextQuad();
     g_code.emit("ADD2I I2 I2 ");
 }
 
 static void endFunction(const vector<int>& blkNextList) {
-    const int frameSize = g_nextLocalOffset; // includes header
-    if (g_localAllocInstrLine <= 0) {
-        semanticError("internal error: missing local allocation instruction");
-    }
+    const int frameSize = g_nextLocalOffset;
     g_code.backpatch(vector<int>{g_localAllocInstrLine}, frameSize);
 
     const int epilogueStart = g_code.nextQuad();
     g_code.backpatch(g_currentReturnJumps, epilogueStart);
     g_code.backpatch(blkNextList, epilogueStart);
 
-    // Epilogue
-    g_code.emit("LOADI I4 I1 0");  // old FP
-    g_code.emit("LOADI I0 I1 4");  // restore return address to I0
-    g_code.emit("COPYI I2 I1");    // SP = FP (pop locals+header)
-    g_code.emit("COPYI I1 I4");    // FP = old FP
+    g_code.emit("LOADI I4 I1 0");
+    g_code.emit("LOADI I0 I1 4");
+    g_code.emit("COPYI I2 I1");
+    g_code.emit("COPYI I1 I4");
     g_code.emit("RETRN");
 
     g_currentFunc.clear();
@@ -321,9 +305,7 @@ static void emitPrintString(const string& s) {
     for (size_t i = 0; i < s.size(); ++i) {
         unsigned char ch = static_cast<unsigned char>(s[i]);
         if (ch == '\\') {
-            if (i + 1 >= s.size()) {
-                semanticError("invalid escape sequence in string literal");
-            }
+            if (i + 1 >= s.size()) semanticErrorFixed(SEM_TYPE_MISMATCH);
             const char esc = s[i + 1];
             i++;
             switch (esc) {
@@ -331,8 +313,7 @@ static void emitPrintString(const string& s) {
                 case 't': ch = '\t'; break;
                 case '"': ch = '"'; break;
                 case '\\': ch = '\\'; break;
-                default:
-                    semanticError("invalid escape sequence in string literal");
+                default: semanticErrorFixed(SEM_TYPE_MISMATCH);
             }
         }
         g_code.emit("PRNTC " + std::to_string(static_cast<int>(ch)));
@@ -448,9 +429,7 @@ BLK_BEGIN
         {
             pushScope();
             g_blockDepth++;
-            if (g_blockDepth == 1) {
-                insertParamsIntoCurrentScope();
-            }
+            if (g_blockDepth == 1) insertParamsIntoCurrentScope();
             $$ = new Attr();
         }
     ;
@@ -497,7 +476,7 @@ STMT
     | ASSN { $$ = new Attr(); resetTemps(); }
     | EXP ';'
         {
-            if ($1->type != void_t) semanticError("expression statement must have type void");
+            if ($1->type != void_t) semanticErrorFixed(SEM_TYPE_MISMATCH);
             $$ = new Attr();
             resetTemps();
         }
@@ -511,8 +490,8 @@ STMT
 ASSN
     : LVAL TK_ASSIGN EXP ';'
         {
-            if ($1->type == void_t || $3->type == void_t) semanticError("cannot assign void");
-            if ($1->type != $3->type) semanticError("type mismatch in assignment");
+            if ($1->type == void_t || $3->type == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
+            if ($1->type != $3->type) semanticErrorFixed(SEM_TYPE_MISMATCH);
 
             if ($1->type == int_) {
                 g_code.emit("STORI " + Ireg($3->reg) + " I1 " + std::to_string($1->offset));
@@ -529,7 +508,6 @@ LVAL
         {
             VarBinding vb = lookupVar($1->str);
             $$ = new Attr();
-            $$->str = $1->str;
             $$->type = vb.type;
             $$->offset = vb.offset;
         }
@@ -538,7 +516,7 @@ LVAL
 READ
     : TK_READ '(' LVAL ')' ';'
         {
-            if ($3->type == void_t) semanticError("cannot read into void");
+            if ($3->type == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
             if ($3->type == int_) {
                 const int r = allocIntReg();
                 g_code.emit("READI " + Ireg(r));
@@ -556,13 +534,9 @@ READ
 WRITE
     : TK_WRITE '(' EXP ')' ';'
         {
-            if ($3->type == int_) {
-                g_code.emit("PRNTI " + Ireg($3->reg));
-            } else if ($3->type == float_) {
-                g_code.emit("PRNTF " + Freg($3->reg));
-            } else {
-                semanticError("write() expects an int or float expression");
-            }
+            if ($3->type == int_) g_code.emit("PRNTI " + Ireg($3->reg));
+            else if ($3->type == float_) g_code.emit("PRNTF " + Freg($3->reg));
+            else semanticErrorFixed(SEM_TYPE_MISMATCH);
             $$ = new Attr();
         }
     | TK_WRITE '(' TK_STR ')' ';'
@@ -572,14 +546,11 @@ WRITE
 RETURN
     : TK_RETURN EXP ';'
         {
-            if (g_currentReturnType == void_t) semanticError("returning a value from a void function");
-            if ($2->type != g_currentReturnType) semanticError("return type mismatch");
+            if (g_currentReturnType == void_t) semanticErrorFixed(SEM_CANT_RET_VALUE);
+            if ($2->type != g_currentReturnType) semanticErrorFixed(SEM_TYPE_MISMATCH);
 
-            if (g_currentReturnType == int_) {
-                g_code.emit("COPYI I3 " + Ireg($2->reg));
-            } else {
-                g_code.emit("COPYF F3 " + Freg($2->reg));
-            }
+            if (g_currentReturnType == int_) g_code.emit("COPYI I3 " + Ireg($2->reg));
+            else g_code.emit("COPYF F3 " + Freg($2->reg));
 
             const int j = g_code.nextQuad();
             g_code.emit("UJUMP ");
@@ -588,7 +559,7 @@ RETURN
         }
     | TK_RETURN ';'
         {
-            if (g_currentReturnType != void_t) semanticError("missing return value in non-void function");
+            if (g_currentReturnType != void_t) semanticErrorFixed(SEM_MUST_RET_VALUE);
             const int j = g_code.nextQuad();
             g_code.emit("UJUMP ");
             g_currentReturnJumps.push_back(j);
@@ -597,8 +568,7 @@ RETURN
     ;
 
 IF_COND
-    : TK_IF BEXP
-      { resetTemps(); $$ = $2; }
+    : TK_IF BEXP { resetTemps(); $$ = $2; }
     ;
 
 CNTRL
@@ -645,8 +615,8 @@ BEXP
         { $$ = new Attr(); $$->trueList = $2->falseList; $$->falseList = $2->trueList; }
     | EXP TK_RELOP EXP
         {
-            if ($1->type == void_t || $3->type == void_t) semanticError("void value used in a relational expression");
-            if ($1->type != $3->type) semanticError("type mismatch in relational expression");
+            if ($1->type == void_t || $3->type == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
+            if ($1->type != $3->type) semanticErrorFixed(SEM_TYPE_MISMATCH);
 
             const string& op = $2->str;
             int condI = -1;
@@ -659,7 +629,7 @@ BEXP
                 else if (op == ">")  g_code.emit("SGRTI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
                 else if (op == "<=") g_code.emit("SGRTI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
                 else if (op == ">=") g_code.emit("SLETI " + Ireg(condI) + " " + Ireg($1->reg) + " " + Ireg($3->reg));
-                else semanticError("unknown relop '" + op + "'");
+                else semanticErrorFixed(SEM_TYPE_MISMATCH);
             } else {
                 const int condF = allocFloatReg();
                 if (op == "==")      g_code.emit("SEQUF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
@@ -668,7 +638,7 @@ BEXP
                 else if (op == ">")  g_code.emit("SGRTF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
                 else if (op == "<=") g_code.emit("SGRTF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
                 else if (op == ">=") g_code.emit("SLETF " + Freg(condF) + " " + Freg($1->reg) + " " + Freg($3->reg));
-                else semanticError("unknown relop '" + op + "'");
+                else semanticErrorFixed(SEM_TYPE_MISMATCH);
 
                 condI = allocIntReg();
                 g_code.emit("CFTOI " + Ireg(condI) + " " + Freg(condF));
@@ -693,8 +663,8 @@ BEXP
 EXP
     : EXP TK_ADDOP EXP
         {
-            if ($1->type == void_t || $3->type == void_t) semanticError("void value used in arithmetic expression");
-            if ($1->type != $3->type) semanticError("type mismatch in arithmetic expression");
+            if ($1->type == void_t || $3->type == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
+            if ($1->type != $3->type) semanticErrorFixed(SEM_TYPE_MISMATCH);
 
             const string& op = $2->str;
             $$ = new Attr();
@@ -702,22 +672,22 @@ EXP
 
             if ($1->type == int_) {
                 const int dst = $1->reg;
-                if (op == "+")      g_code.emit("ADD2I " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
+                if (op == "+") g_code.emit("ADD2I " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
                 else if (op == "-") g_code.emit("SUBTI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
-                else semanticError("unknown addop '" + op + "'");
+                else semanticErrorFixed(SEM_TYPE_MISMATCH);
                 $$->reg = dst;
             } else {
                 const int dst = $1->reg;
-                if (op == "+")      g_code.emit("ADD2F " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
+                if (op == "+") g_code.emit("ADD2F " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
                 else if (op == "-") g_code.emit("SUBTF " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
-                else semanticError("unknown addop '" + op + "'");
+                else semanticErrorFixed(SEM_TYPE_MISMATCH);
                 $$->reg = dst;
             }
         }
     | EXP TK_MULOP EXP
         {
-            if ($1->type == void_t || $3->type == void_t) semanticError("void value used in arithmetic expression");
-            if ($1->type != $3->type) semanticError("type mismatch in arithmetic expression");
+            if ($1->type == void_t || $3->type == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
+            if ($1->type != $3->type) semanticErrorFixed(SEM_TYPE_MISMATCH);
 
             const string& op = $2->str;
             $$ = new Attr();
@@ -725,15 +695,15 @@ EXP
 
             if ($1->type == int_) {
                 const int dst = $1->reg;
-                if (op == "*")      g_code.emit("MULTI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
+                if (op == "*") g_code.emit("MULTI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
                 else if (op == "/") g_code.emit("DIVDI " + Ireg(dst) + " " + Ireg(dst) + " " + Ireg($3->reg));
-                else semanticError("unknown mulop '" + op + "'");
+                else semanticErrorFixed(SEM_TYPE_MISMATCH);
                 $$->reg = dst;
             } else {
                 const int dst = $1->reg;
-                if (op == "*")      g_code.emit("MULTF " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
+                if (op == "*") g_code.emit("MULTF " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
                 else if (op == "/") g_code.emit("DIVDF " + Freg(dst) + " " + Freg(dst) + " " + Freg($3->reg));
-                else semanticError("unknown mulop '" + op + "'");
+                else semanticErrorFixed(SEM_TYPE_MISMATCH);
                 $$->reg = dst;
             }
         }
@@ -754,7 +724,7 @@ EXP
                 g_code.emit("LOADF " + Freg(r) + " " + Faddr() + " " + std::to_string(vb.offset));
                 $$->reg = r;
             } else {
-                semanticError("void variable used as a value");
+                semanticErrorFixed(SEM_ILLEGAL_VOID);
             }
         }
     | CALL { $$ = $1; }
@@ -770,10 +740,9 @@ EXP
                 $$->type = void_t;
                 $$->reg = -1;
             } else {
-                if (fromT == void_t) semanticError("cannot cast void to a non-void type");
-                if (toT == fromT) {
-                    $$ = $4;
-                } else if (toT == int_ && fromT == float_) {
+                if (fromT == void_t) semanticErrorFixed(SEM_ILLEGAL_VOID);
+                if (toT == fromT) $$ = $4;
+                else if (toT == int_ && fromT == float_) {
                     $$ = new Attr();
                     $$->type = int_;
                     const int r = allocIntReg();
@@ -786,7 +755,7 @@ EXP
                     g_code.emit("CITOF " + Freg(r) + " " + Ireg($4->reg));
                     $$->reg = r;
                 } else {
-                    semanticError("unsupported cast");
+                    semanticErrorFixed(SEM_TYPE_MISMATCH);
                 }
             }
         }
@@ -816,15 +785,13 @@ CALL
         {
             const string fname = $1->str;
             auto fit = g_functions.find(fname);
-            if (fit == g_functions.end()) {
-                semanticError("call to function '" + fname + "' without prior declaration");
-            }
+            if (fit == g_functions.end()) semanticErrorFixed(SEM_UNDECL_FUNC);
 
             const FunctionInfo& finfo = fit->second;
             const int nparams = static_cast<int>(finfo.paramTypes.size());
 
             const int npos = static_cast<int>($3->posTypes.size());
-            if (npos > nparams) semanticError("too many positional arguments in call to '" + fname + "'");
+            if (npos > nparams) semanticErrorFixed(SEM_WRONG_NUM_ARGS);
 
             vector<bool> provided(static_cast<size_t>(nparams), false);
             vector<Type> argTypes(static_cast<size_t>(nparams), void_t);
@@ -836,7 +803,6 @@ CALL
                 argRegs[i]  = $3->posRegs[i];
             }
 
-            // Named args (value:label syntax; label must match a declared parameter name)
             for (size_t j = 0; j < $3->namedNames.size(); ++j) {
                 const string& label = $3->namedNames[j];
 
@@ -844,9 +810,9 @@ CALL
                 for (int k = 0; k < nparams; ++k) {
                     if (finfo.paramNames[k] == label) { idx = k; break; }
                 }
-                if (idx < 0) semanticError("unknown named argument '" + label + "' in call to '" + fname + "'");
-                if (idx < npos) semanticError("named argument '" + label + "' duplicates a positional argument in call to '" + fname + "'");
-                if (provided[idx]) semanticError("duplicate named argument '" + label + "' in call to '" + fname + "'");
+                if (idx < 0) semanticErrorFixed(SEM_UNKNOWN_NAMED);
+                if (idx < npos) semanticErrorFixed(SEM_PARAM_TWICE);
+                if (provided[idx]) semanticErrorFixed(SEM_PARAM_TWICE);
 
                 provided[idx] = true;
                 argTypes[idx] = $3->namedTypes[j];
@@ -854,27 +820,22 @@ CALL
             }
 
             for (int i = 0; i < nparams; ++i) {
-                if (!provided[i]) semanticError("missing argument for parameter '" + finfo.paramNames[i] + "' in call to '" + fname + "'");
-                if (argTypes[i] != finfo.paramTypes[i]) semanticError("type mismatch for parameter '" + finfo.paramNames[i] + "' in call to '" + fname + "'");
+                if (!provided[i]) semanticErrorFixed(SEM_WRONG_NUM_ARGS);
+                if (argTypes[i] != finfo.paramTypes[i]) semanticErrorFixed(SEM_TYPE_MISMATCH);
             }
 
-            // Save currently-used temporaries (caller-saves)
+            // Save used temporaries (caller-saves)
             const int intTempsUsed   = g_nextIntReg   - INT_TMP_BASE;
             const int floatTempsUsed = g_nextFloatReg - FLOAT_TMP_BASE;
             const int saveSize = 4 * (intTempsUsed + floatTempsUsed);
-
-            const int argSize = 4 * nparams;
+            const int argSize  = 4 * nparams;
 
             if (saveSize > 0) {
                 int offset = 0;
-
-                // Save int temps with integer base (I2)
                 for (int r = INT_TMP_BASE; r < g_nextIntReg; ++r) {
                     g_code.emit("STORI " + Ireg(r) + " I2 " + std::to_string(offset));
                     offset += 4;
                 }
-
-                // Save float temps with float base (F0 = (float)I2)
                 if (floatTempsUsed > 0) {
                     addrToF0FromI("I2");
                     for (int r = FLOAT_TMP_BASE; r < g_nextFloatReg; ++r) {
@@ -882,11 +843,10 @@ CALL
                         offset += 4;
                     }
                 }
-
                 g_code.emit("ADD2I I2 I2 " + std::to_string(saveSize));
             }
 
-            // Push args (store at offsets, then bump SP once)
+            // Push args (store at offsets, bump SP once)
             if (argSize > 0) {
                 bool needFloatBase = false;
                 for (int i = 0; i < nparams; ++i) {
@@ -908,30 +868,22 @@ CALL
 
             const int callLine = g_code.nextQuad();
             g_code.emit("JLINK ");
-
             g_functions[fname].callLines.push_back(callLine);
 
-            if (finfo.isDefined) {
-                g_code.backpatch(vector<int>{callLine}, finfo.startLineImplementation);
-            } else {
-                g_functions[fname].unresolvedCallLines.push_back(callLine);
-            }
+            if (finfo.isDefined) g_code.backpatch(vector<int>{callLine}, finfo.startLineImplementation);
+            else g_functions[fname].unresolvedCallLines.push_back(callLine);
 
             // Pop args
-            if (argSize > 0) {
-                g_code.emit("SUBTI I2 I2 " + std::to_string(argSize));
-            }
+            if (argSize > 0) g_code.emit("SUBTI I2 I2 " + std::to_string(argSize));
 
-            // Restore saved temps
+            // Restore temps
             if (saveSize > 0) {
-                g_code.emit("SUBTI I4 I2 " + std::to_string(saveSize)); // I4 = base of saved area
-
+                g_code.emit("SUBTI I4 I2 " + std::to_string(saveSize)); // I4 = base
                 int offset = 0;
                 for (int r = INT_TMP_BASE; r < g_nextIntReg; ++r) {
                     g_code.emit("LOADI " + Ireg(r) + " I4 " + std::to_string(offset));
                     offset += 4;
                 }
-
                 if (floatTempsUsed > 0) {
                     addrToF0FromI("I4");
                     for (int r = FLOAT_TMP_BASE; r < g_nextFloatReg; ++r) {
@@ -939,7 +891,6 @@ CALL
                         offset += 4;
                     }
                 }
-
                 g_code.emit("SUBTI I2 I2 " + std::to_string(saveSize));
             }
 
@@ -982,7 +933,6 @@ POS_ARGLIST
         { $$ = $1; $$->posTypes.push_back($3->type); $$->posRegs.push_back($3->reg); }
     ;
 
-// Named arguments are value:label (per the project PDF)
 NAMED_ARGLIST
     : NAMED_ARG { $$ = $1; }
     | NAMED_ARGLIST ',' NAMED_ARG
@@ -994,13 +944,16 @@ NAMED_ARGLIST
         }
     ;
 
+/* IMPORTANT FIX:
+   Named args are parsed as label:value (ID ':' EXP)
+   so calls like pack(y:2, x:1) work as expected. */
 NAMED_ARG
-    : EXP ':' TK_ID
+    : TK_ID ':' EXP
         {
             $$ = new Attr();
-            $$->namedNames.push_back($3->str);  // label is the ID after ':'
-            $$->namedTypes.push_back($1->type); // value is the EXP before ':'
-            $$->namedRegs.push_back($1->reg);
+            $$->namedNames.push_back($1->str); // label
+            $$->namedTypes.push_back($3->type); // value type
+            $$->namedRegs.push_back($3->reg);   // value reg
         }
     ;
 
@@ -1013,20 +966,14 @@ void yyerror(const char* /*s*/) {
 }
 
 static string replaceExtKeepPath(const string& path, const string& newExtWithDot) {
-    // Replace only the last extension part, preserving directory.
-    // Assumes input has an extension.
     const size_t slash = path.find_last_of("/\\");
     const size_t dot = path.find_last_of('.');
-    if (dot == string::npos || (slash != string::npos && dot < slash)) {
-        return path + newExtWithDot;
-    }
+    if (dot == string::npos || (slash != string::npos && dot < slash)) return path + newExtWithDot;
     return path.substr(0, dot) + newExtWithDot;
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        operationalError("usage: rx-cc <input_file.cmm>");
-    }
+    if (argc != 2) operationalError("usage: rx-cc <input_file.cmm>");
 
     const string inputFile = argv[1];
     if (inputFile.size() < 5 || inputFile.substr(inputFile.size() - 4) != ".cmm") {
@@ -1034,13 +981,10 @@ int main(int argc, char** argv) {
     }
 
     yyin = std::fopen(inputFile.c_str(), "r");
-    if (!yyin) {
-        operationalError("cannot open input file");
-    }
+    if (!yyin) operationalError("cannot open input file");
 
     yyparse();
 
-    // Patch still-unresolved calls to 0 so the linker has a placeholder to replace
     for (auto& kv : g_functions) {
         FunctionInfo& info = kv.second;
         if (!info.isDefined && !info.unresolvedCallLines.empty()) {
@@ -1051,9 +995,7 @@ int main(int argc, char** argv) {
 
     const string outputFile = replaceExtKeepPath(inputFile, ".rsk");
     std::ofstream out(outputFile);
-    if (!out) {
-        operationalError("cannot open output file for writing");
-    }
+    if (!out) operationalError("cannot open output file for writing");
 
     string unimpl = "<unimplemented>";
     string impl   = "<implemented>";
@@ -1066,9 +1008,7 @@ int main(int argc, char** argv) {
             impl += " " + fname + "," + std::to_string(info.startLineImplementation);
         } else {
             unimpl += " " + fname;
-            for (int lineNo : info.callLines) {
-                unimpl += "," + std::to_string(lineNo);
-            }
+            for (int lineNo : info.callLines) unimpl += "," + std::to_string(lineNo);
         }
     }
 

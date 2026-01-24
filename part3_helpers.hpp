@@ -4,6 +4,11 @@
 
     This header contains small helper utilities shared by the Flex scanner
     and the Bison parser.
+
+    Design note:
+    - Bison/Flex communicate semantic values using Attr* (pointers to heap objects).
+    - Attr acts as a “bundle” of fields used by different nonterminals (expressions,
+      boolean backpatch lists, argument lists, etc.). Not all fields are used everywhere.
 */
 
 #ifndef PART3_HELPERS_HPP
@@ -41,10 +46,12 @@ struct Attr {
     // expressions). Can be negative (for parameters).
     int offset = 0;
 
-    // Marker quad (instruction index)
+    // Marker quad (instruction index / "line number" in generated Riski)
     int quad = -1;
 
-    // Backpatching lists
+    // Backpatching lists:
+    //  - nextList: where control should continue after a statement
+    //  - trueList/falseList: conditional branches to patch for boolean expressions
     std::vector<int> nextList;
     std::vector<int> trueList;
     std::vector<int> falseList;
@@ -70,6 +77,10 @@ static inline std::string itos(int v) {
     return std::to_string(v);
 }
 
+/*
+ * Merge two backpatch lists. We keep this small helper in the header because it is used
+ * directly in many semantic actions.
+ */
 static inline std::vector<int> mergeLists(const std::vector<int>& a, const std::vector<int>& b) {
     std::vector<int> out;
     out.reserve(a.size() + b.size());
@@ -78,12 +89,17 @@ static inline std::vector<int> mergeLists(const std::vector<int>& a, const std::
     return out;
 }
 
-// A very small "code buffer" that stores the generated Riski assembly.
-//
-// Line numbers are 1-based (the first emitted instruction is line 1).
-// Backpatching works by emitting jump instructions with a trailing space,
-// e.g. "UJUMP " or "BREQZ I10 ", and then later appending the absolute
-// jump target line number.
+/*
+ * CodeBuffer: a tiny “emitter” for Riski assembly.
+ *
+ * - We store one instruction per string (one per line).
+ * - nextQuad() returns the next instruction line number (1-based).
+ * - Backpatching convention:
+ *    Emit jumps with a trailing space, e.g. "UJUMP " or "BNEQZ I11 ",
+ *    then later backpatch(...) appends the numeric target label.
+ *
+ * This matches the backpatching approach taught in the course and required by the PDF.
+ */
 class CodeBuffer {
 public:
     int nextQuad() const;
@@ -103,6 +119,5 @@ public:
 private:
     std::vector<std::string> m_lines;
 };
-
 
 #endif

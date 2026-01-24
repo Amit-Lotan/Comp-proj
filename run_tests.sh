@@ -57,18 +57,19 @@ run_test() {
         return
     fi
 
-    # Enter test directory to ensure linker finds local rx-runtime.rsk
-    # and paths remain simple
+    # Enter test directory
     pushd "$test_path" > /dev/null
 
     # Clean up previous artifacts
-    rm -f test.rsk test.e my_output.txt diff.log
+    rm -f test.rsk helper.rsk test.e my_output.txt diff.log compilation.log compilation_helper.log linker.log
 
-    # 1. RUN COMPILER
+    # ---------------------------------------------------------
+    # 1. RUN COMPILER (Main Test File)
+    # ---------------------------------------------------------
     "$COMPILER" test.cmm > compilation.log 2>&1
     local cc_exit=$?
 
-    # CASE: Expected Compilation FAILURE
+    # CASE: Expected Compilation FAILURE (The test itself is bad code)
     if [ "$expect_pass" = false ]; then
         if [ $cc_exit -ne 0 ]; then
             echo -e "${GREEN}PASS (Compilation failed as expected)${NC}"
@@ -81,20 +82,44 @@ run_test() {
 
     # CASE: Expected Compilation SUCCESS
     if [ $cc_exit -ne 0 ]; then
-        echo -e "${RED}FAIL (Compilation error)${NC}"
+        echo -e "${RED}FAIL (Compilation error in test.cmm)${NC}"
         echo "  See $test_path/compilation.log"
         popd > /dev/null
         return
     fi
 
-    # 2. RUN LINKER
-    # Linker requires rx-runtime.rsk in current dir 
+    # ---------------------------------------------------------
+    # 2. RUN COMPILER (Helper File)
+    # ---------------------------------------------------------
+    local has_helper=false
+    if [[ -f "helper.cmm" ]]; then
+        has_helper=true
+        "$COMPILER" helper.cmm > compilation_helper.log 2>&1
+        local helper_exit=$?
+        
+        if [ $helper_exit -ne 0 ]; then
+            echo -e "${RED}FAIL (Compilation error in helper.cmm)${NC}"
+            echo "  See $test_path/compilation_helper.log"
+            popd > /dev/null
+            return
+        fi
+    fi
+
+    # ---------------------------------------------------------
+    # 3. RUN LINKER
+    # ---------------------------------------------------------
+    # Linker requires rx-runtime.rsk in current dir
     if [[ ! -f "rx-runtime.rsk" ]]; then
-         # Fallback: copy from root if missing in test folder
          cp "$ROOT_DIR/rx-runtime.rsk" . 2>/dev/null
     fi
 
-    "$LINKER" test.rsk > linker.log 2>&1
+    # Construct linker arguments: Main file first (to set executable name), then helper
+    local link_args="test.rsk"
+    if [ "$has_helper" = true ]; then
+        link_args="test.rsk helper.rsk"
+    fi
+
+    "$LINKER" $link_args > linker.log 2>&1
     local ld_exit=$?
 
     if [ $ld_exit -ne 0 ]; then
@@ -104,8 +129,9 @@ run_test() {
         return
     fi
 
-    # 3. RUN VM
-    # The linker usually produces 'test.e' (first filename with .e) [cite: 297]
+    # ---------------------------------------------------------
+    # 4. RUN VM
+    # ---------------------------------------------------------
     local exe_name="test.e"
     if [[ ! -f "$exe_name" ]]; then
         echo -e "${RED}FAIL (Linker succeeded but $exe_name not found)${NC}"
@@ -113,36 +139,37 @@ run_test() {
         return
     fi
 
-    # Handle input file (if empty/missing, ensure empty file exists for redirection)
-    local input_arg="input.input"
-    if [[ ! -f "input.input" ]]; then
+    # Handle input file (input.in)
+    local input_arg="input.in"
+    if [[ ! -f "input.in" ]]; then
+        # Create temp empty input if input.in doesn't exist to prevent VM hang
         touch empty_input.tmp
         input_arg="empty_input.tmp"
     fi
 
     "$VM" "$exe_name" < "$input_arg" > my_output.txt 2>&1
-    local vm_exit=$?
     
     # Cleanup temp input
     [ -f empty_input.tmp ] && rm empty_input.tmp
 
-    # 4. COMPARE OUTPUT
-    if [[ ! -f "output.output" ]]; then
-        # If expected output is missing, warn but assume pass if VM ran?
-        # Usually strict matching is better.
-        echo -e "${YELLOW}WARN (output.output missing, cannot verify)${NC}"
+    # ---------------------------------------------------------
+    # 5. COMPARE OUTPUT
+    # ---------------------------------------------------------
+    if [[ ! -f "output.out" ]]; then
+        # If output.out is missing, we warn but cannot verify correctness
+        echo -e "${YELLOW}WARN (output.out missing, cannot verify)${NC}"
     else
-        # Using diff -w to ignore whitespace changes (like trailing newlines)
-        diff -w output.output my_output.txt > diff.log
+        # Using diff -w to ignore whitespace changes
+        diff -w output.out my_output.txt > diff.log
         local diff_exit=$?
 
         if [ $diff_exit -eq 0 ]; then
              echo -e "${GREEN}PASS${NC}"
         else
              echo -e "${RED}FAIL (Output mismatch)${NC}"
-             echo "  Expected:"
-             head -n 5 output.output
-             echo "  Got:"
+             echo "  Expected (first 5 lines):"
+             head -n 5 output.out
+             echo "  Got (first 5 lines):"
              head -n 5 my_output.txt
              echo "  (See $test_path/diff.log for full details)"
         fi
@@ -155,7 +182,6 @@ run_test() {
 echo "Running tests in: $SUITE_DIR"
 echo "----------------------------------------"
 
-# Loop strictly through test1 to test10 to maintain order
 for i in {1..10}; do
     target_folder="$SUITE_DIR/test$i"
     if [[ -d "$target_folder" ]]; then

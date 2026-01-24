@@ -591,9 +591,8 @@ ASSN
 				g_code.emit("STORI " + Ireg($3->reg) + " I1 " + std::to_string($1->offset));
 			} else {
 				int addrF = allocFloatReg();
-				g_code.emit("CITOF " + Freg(addrF) + " I1");
-				// Use F-register for address and append .0 to offset to make it a float constant
-				g_code.emit("STORF " + Freg($3->reg) + " " + Freg(addrF) + " " + std::to_string($1->offset) + ".0");
+				g_code.emit("CITOF " + Freg(addrF) + " I1");				
+				g_code.emit("STORF " + Freg($3->reg) + " " + Freg(addrF) + " " + std::to_string($1->offset));
 			}
 			$$ = new Attr();
         }
@@ -625,7 +624,7 @@ READ
 				g_code.emit("READF " + Freg(r));
 				int addrF = allocFloatReg();
 				g_code.emit("CITOF " + Freg(addrF) + " I1");
-				g_code.emit("STORF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string($3->offset) + ".0");
+				g_code.emit("STORF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string($3->offset));
 			}
 			$$ = new Attr();
         }
@@ -891,7 +890,7 @@ EXP
 				const int r = allocFloatReg();        
 				int addrF = allocFloatReg();
 				g_code.emit("CITOF " + Freg(addrF) + " I1");
-				g_code.emit("LOADF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(vb.offset) + ".0");
+				g_code.emit("LOADF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(vb.offset));
 				$$->reg = r;
 			} else {
                 semanticError("void variable used as a value");
@@ -1040,7 +1039,7 @@ CALL
                 for (int r = FLOAT_TMP_BASE; r < floatLimit; ++r) {
                     int addrF = allocFloatReg();
                     g_code.emit("CITOF " + Freg(addrF) + " I2");
-                    g_code.emit("STORF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(offset) + ".0");
+                    g_code.emit("STORF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(offset));
                     offset += 4;
                 }
                 g_code.emit("ADD2I I2 I2 " + std::to_string(saveSize));
@@ -1053,7 +1052,7 @@ CALL
                 } else {
                     int addrF = allocFloatReg();
                     g_code.emit("CITOF " + Freg(addrF) + " I2");
-                    g_code.emit("STORF " + Freg(argRegs[i]) + " " + Freg(addrF) + " 0.0");
+                    g_code.emit("STORF " + Freg(argRegs[i]) + " " + Freg(addrF) + " 0");
                 }
                 g_code.emit("ADD2I I2 I2 4");
             }
@@ -1087,7 +1086,7 @@ CALL
                 for (int r = FLOAT_TMP_BASE; r < floatLimit; ++r) {
                     int addrF = allocFloatReg();
                     g_code.emit("CITOF " + Freg(addrF) + " I4");
-                    g_code.emit("LOADF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(offset) + ".0");
+                    g_code.emit("LOADF " + Freg(r) + " " + Freg(addrF) + " " + std::to_string(offset));
                     offset += 4;
                 }
 

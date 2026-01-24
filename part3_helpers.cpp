@@ -2,7 +2,7 @@
 
 /*
  * nextQuad():
- *  Riski instruction addresses are *line numbers*, starting at 1.
+ *  Riski instruction addresses are line numbers, starting at 1.
  *  Since m_lines holds already-emitted lines, the next quad is size()+1.
  */
 int CodeBuffer::nextQuad() const {
@@ -39,7 +39,7 @@ const std::vector<std::string>& CodeBuffer::getLines() const {
 
 /*
  * patchLine():
- *  Utility to replace a specific instruction. Used sparingly (most patching is done by
+ *  Utility function to replace a specific instruction (most patching is done by
  *  backpatch()). No-op if lineNo is out of range.
  */
 void CodeBuffer::patchLine(int lineNo, const std::string& newLine) {

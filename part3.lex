@@ -26,7 +26,15 @@ COMMENT       \#.*
 
 {WS}                { /* skip */ }
 {COMMENT}           { /* skip */ }
-\n                  { /* yylineno is updated automatically */ }
+\n                  { /* yylineno updated automatically */ }
+
+/* IMPORTANT: '//' is NOT a comment in this language.
+   The tests expect it to be a lexical error on the full lexeme "//". */
+"//"                {
+                        std::cerr << "Lexical error: '" << yytext
+                                  << "' in line number " << yylineno << "\n";
+                        std::exit(LEXICAL_ERROR);
+                    }
 
 "int"               { return TK_INT; }
 "float"             { return TK_FLOAT; }
@@ -74,39 +82,38 @@ COMMENT       \#.*
 {STR}               {
                         std::string s(yytext);
                         yylval.a = new Attr();
-                        if (s.size() >= 2) {
-                            yylval.a->str = s.substr(1, s.size() - 2);
-                        } else {
-                            yylval.a->str.clear();
-                        }
+                        if (s.size() >= 2) yylval.a->str = s.substr(1, s.size() - 2);
+                        else yylval.a->str.clear();
                         return TK_STR;
                     }
 
 {BADSTR}            {
-                        std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
+                        std::cerr << "Lexical error: '" << yytext
+                                  << "' in line number " << yylineno << "\n";
                         std::exit(LEXICAL_ERROR);
                     }
 
-{REALNUM}            {
+{REALNUM}           {
                         yylval.a = new Attr();
                         yylval.a->str = yytext;
                         return TK_REALNUM;
                     }
 
-{INTEGERNUM}         {
+{INTEGERNUM}        {
                         yylval.a = new Attr();
                         yylval.a->str = yytext;
                         return TK_INTEGERNUM;
                     }
 
-{ID}                 {
+{ID}                {
                         yylval.a = new Attr();
                         yylval.a->str = yytext;
                         return TK_ID;
                     }
 
-.                    {
-                        std::cerr << "Lexical error: '" << yytext << "' in line number " << yylineno << "\n";
+.                   {
+                        std::cerr << "Lexical error: '" << yytext
+                                  << "' in line number " << yylineno << "\n";
                         std::exit(LEXICAL_ERROR);
                     }
 
